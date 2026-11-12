@@ -72,11 +72,11 @@ See [AGENTS.md](AGENTS.md) for detailed architecture documentation.
 - **OCR**: Vision framework (macOS native)
 - **Video**: VideoToolbox (HEVC encoding)
 - **Database**: SQLite with FTS5 full-text search
+- **Semantic search** (optional, off by default): EmbeddingGemma 2 on llama.cpp, over OCR text and optionally screenshots; run `scripts/build_llama_embedding.sh` before building to include it
 
 ### Planned for Future Releases
 
 - **Audio transcription**: whisper.cpp (bundled, ready but disabled)
-- **Embeddings**: llama.cpp for semantic search (prepared but not active)
 - **Stored-data encryption**: AES-256-GCM encryption is in progress
 
 ## Requirements
@@ -132,6 +132,20 @@ swift build -c release
 5. Configure settings (capture interval, excluded apps, shortcuts)
 
 The app will create its database at the default location (`~/Library/Application Support/Retrace/`) or a custom location if configured in Settings.
+
+**Semantic search (optional):**
+
+Semantic search needs llama.cpp, which is built separately (needs git, cmake and Xcode). Build it once, then build Retrace as usual:
+
+```bash
+# Build the pinned llama.cpp into Vendors/llamacpp (not tracked by git)
+scripts/build_llama_embedding.sh
+
+# Build Retrace; the embedding helper is now included
+swift build        # or ./dev.sh
+```
+
+Then turn it on in Settings → Advanced → Semantic Search. Without the first step Retrace builds and runs without semantic search.
 
 ### 3. Development Scripts
 
@@ -249,11 +263,13 @@ Retrace uses minimal external dependencies:
 
 - **[swift-sqlcipher](https://github.com/skiptools/swift-sqlcipher)** - SQLite with encryption for Rewind database import
 - **[Sparkle](https://github.com/sparkle-project/Sparkle)** - Auto-update framework
+- **llama.cpp** (built from a pinned commit by `scripts/build_llama_embedding.sh`, not tracked in the repo) - embeddings for semantic search
 - **Apple Frameworks**: CoreGraphics, Vision, AppKit, SwiftUI, VideoToolbox, CryptoKit
 
 Future releases will add:
 - **whisper.cpp** (bundled in Vendors/) - Local audio transcription
-- **llama.cpp** (bundled in Vendors/) - Local embeddings for semantic search
+
+Licence notices for llama.cpp and for code ported from DigUp are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Contributing
 
@@ -279,7 +295,7 @@ Created with ♥ by [@haseab](https://github.com/haseab)
 
 - Inspired by [Rewind AI](https://www.rewind.ai/)
 - Future audio transcription will use [whisper.cpp](https://github.com/ggerganov/whisper.cpp) by @ggerganov
-- Future semantic search will use [llama.cpp](https://github.com/ggerganov/llama.cpp) by @ggerganov
+- Semantic search uses [llama.cpp](https://github.com/ggml-org/llama.cpp) by @ggerganov and code ported from [DigUp](https://github.com/ARahim3/DigUp) (MIT)
 
 ---
 

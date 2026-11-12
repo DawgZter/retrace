@@ -1,5 +1,9 @@
 # Vector Search - Disabled for Production
 
+> **Superseded.** Semantic search now lives in `Search/Semantic/` (EmbeddingGemma 2 through a helper process,
+> vectors in the `frame_embedding` table, brute-force scan of float16 rows). This folder is the earlier Nomic-based
+> prototype, kept for reference and still excluded from the build.
+
 This folder contains the vector search/semantic search implementation that has been **disabled from production builds**.
 
 ## What's Here

@@ -1,5 +1,7 @@
 # Bundled llama.cpp Library
 
+> This directory is not used by the semantic search in `Search/Semantic/`, which builds its own pinned llama.cpp with `scripts/build_llama_embedding.sh` because the EmbeddingGemma 2 model needs llama.cpp b11452 or later.
+
 This directory contains the pre-compiled llama.cpp library bundled with Retrace for semantic search embeddings.
 
 ## Contents

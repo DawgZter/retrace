@@ -4,7 +4,7 @@
 
 Retrace is a local-first screen recording and search application for macOS, inspired by Rewind AI. It captures screens, extracts text via OCR, and makes everything searchable—all locally on-device.
 
-**Status**: Core screen capture (CGWindowListCapture), OCR (Vision), full-text search (FTS5), HEVC encoding, and Rewind import are working. Audio transcription and vector search are planned for future releases.
+**Status**: Core screen capture (CGWindowListCapture), OCR (Vision), full-text search (FTS5), HEVC encoding, and Rewind import are working. Semantic search over OCR text and, optionally, screenshots (EmbeddingGemma 2 on llama.cpp) is implemented behind Settings toggles, off by default. Audio transcription is planned for a future release.
 
 ---
 
@@ -45,7 +45,12 @@ swift test --filter testSpecificMethod
 
 # Clean build artifacts
 rm -rf .build/
+
+# Optional: build llama.cpp so the next swift build includes RetraceEmbeddingHelper (semantic search)
+scripts/build_llama_embedding.sh
 ```
+
+`Package.swift` adds the `RetraceEmbeddingHelper` target only when `Vendors/llamacpp/lib/libllamacpp.a` exists. SwiftPM caches the evaluated manifest and does not notice that file appearing or disappearing, so `scripts/build_llama_embedding.sh` clears SwiftPM's manifest cache each time it runs. If the helper target is missing although the library is there, run the script again.
 
 ---
 
@@ -63,9 +68,12 @@ retrace/
 ├── AI_ISSUE_TEMPLATE.md         # Canonical markdown template for AI-authored bug reports
 ├── README.md                    # Human-readable project overview
 ├── CONTRIBUTING.md              # Contribution guidelines
+├── THIRD_PARTY_NOTICES.md       # Licence notices: llama.cpp, code ported from DigUp, the EmbeddingGemma 2 model
 ├── Package.swift                # Swift Package Manager configuration
 ├── scripts/                     # Build/release/validation scripts
 │   ├── create-release.sh        # Signed Release archive/export helper
+│   ├── build_llama_embedding.sh # Builds pinned llama.cpp into Vendors/llamacpp for RetraceEmbeddingHelper, then clears SwiftPM's manifest cache
+│   ├── llama-embedding-no-logits.patch # One-line llama.cpp patch applied by build_llama_embedding.sh
 │   ├── check_no_nanoseconds_sleep.sh # Guardrail for Task.sleep(nanoseconds:)
 │   ├── validate_sleep_wake_stability.sh # Sleep/wake soak validation workflow
 │   └── validate_darkwake_watchdog.sh # Automated darkwake watchdog regression validation
@@ -96,6 +104,7 @@ retrace/
 │       ├── CaptureProtocol.swift
 │       ├── ProcessingProtocol.swift
 │       ├── SearchProtocol.swift
+│       ├── SemanticSearchProtocol.swift # Semantic search settings, EmbeddingStoreProtocol, SemanticMatch, index status
 │       └── MigrationProtocol.swift
 │
 ├── Database/                    # SQLite + FTS5 storage
@@ -106,8 +115,8 @@ retrace/
 │   ├── FTSManager.swift         # Full-text search management
 │   ├── IDMappingService.swift   # ID mapping between sources
 │   ├── Schema.swift             # Current schema definition
-│   ├── Migrations/              # Schema migration scripts
-│   ├── Queries/                 # Query implementations
+│   ├── Migrations/              # Schema migration scripts (V20: frame_embedding table + cleanup triggers)
+│   ├── Queries/                 # Query implementations (EmbeddingQueries.swift: frame_embedding SQL + DatabaseManager conformance)
 │   └── Tests/
 │
 ├── Storage/                     # File I/O, HEVC encoding
@@ -148,7 +157,8 @@ retrace/
 │   ├── IngestionManager.swift   # Search index ingestion
 │   ├── QueryParser/             # Query parsing (app:, date:, -exclude)
 │   ├── Ranking/                 # Result ranking implementation
-│   ├── VectorSearchTODO/        # Planned for Release 2 (excluded from build)
+│   ├── Semantic/                # Semantic search: helper client, vector index, image sizing, service, background indexer
+│   ├── VectorSearchTODO/        # Earlier Nomic-based prototype, superseded by Semantic/ (excluded from build)
 │   └── Tests/
 │
 ├── Migration/                   # Import from other apps
@@ -162,17 +172,23 @@ retrace/
 │   ├── FeedbackRecentMetricSupport.swift # Shared feedback-export metric models and sanitization helpers
 │   ├── ServiceContainer.swift   # Dependency injection container
 │   ├── AppLifecycle.swift       # App lifecycle management
-│   ├── ModelManager.swift       # Model management
+│   ├── ModelManager.swift       # Model downloads (EmbeddingGemma 2 text model + image encoder, pinned checksums, progress)
 │   ├── OnboardingManager.swift  # First-run onboarding flow
 │   ├── RetentionManager.swift   # Data retention policies
 │   └── Tests/
 │       ├── FeedbackRecentMetricSupportTests.swift # Feedback-export metric sanitization coverage
 │       ├── InPageURLCaptureRoutingTests.swift
 │       ├── MasterKeyManagerTests.swift
+│       ├── ModelManagerDownloadTests.swift # One download per model file, cancellation, checksum and cleanup (real files)
+│       ├── SemanticSearchAdapterTests.swift # Semantic matches through DataAdapter.search (+ env-gated live test)
 │       ├── ServiceContainerRewindCutoffTests.swift # Rewind cutoff defaults and latest-frame probe coverage
 │       ├── TestLogger.swift
 │       ├── TimelineStillDiskWriterTests.swift
 │       └── UnexpectedRecordingStopHeuristicTests.swift # Unexpected-stop watchdog heuristic coverage
+│
+├── Sources/
+│   ├── CLlamaEmbedding/         # Module map for the llama.cpp static library in Vendors/llamacpp
+│   └── RetraceEmbeddingHelper/  # Embedding model (text + image encoder) as a child process; built only when llama.cpp is (SwiftPM; the Xcode target always builds it)
 │
 └── UI/                          # SwiftUI interface
     ├── AGENTS.md
@@ -187,6 +203,7 @@ retrace/
     │   └── ProcessMonitorModels.swift # System Monitor snapshot/models + ranking helpers
     ├── ViewModels/              # View models (Dashboard, Search, Timeline, Feedback, Settings)
     │   └── Settings/            # Settings-specific view models and extracted helper logic
+    │       └── SemanticSearchSettingsModel.swift # Shared model for the Semantic Search card: switches, downloads, index status
     ├── Views/
     │   ├── Dashboard/           # App usage analytics views and confirmed bulk segment hide/delete actions
     │   ├── FullscreenTimeline/  # Timeline scrubbing & playback (10 views)
@@ -215,7 +232,7 @@ retrace/
 | **STORAGE**    | `Storage/`    | `Storage/AGENTS.md`    | File I/O, HEVC video encoding (working, not optimized), encryption |
 | **CAPTURE**    | `Capture/`    | `Capture/AGENTS.md`    | CGWindowListCapture API, frame deduplication, metadata extraction  |
 | **PROCESSING** | `Processing/` | `Processing/AGENTS.md` | Vision OCR, Accessibility API (no audio transcription yet)         |
-| **SEARCH**     | `Search/`     | `Search/AGENTS.md`     | Query parsing, FTS5 queries, result ranking (no vector search yet) |
+| **SEARCH**     | `Search/`     | `Search/AGENTS.md`     | Query parsing, FTS5 queries, result ranking, semantic search       |
 | **MIGRATION**  | `Migration/`  | `Migration/AGENTS.md`  | Import from Rewind AI (Rewind only, others planned)                |
 | **APP**        | `App/`        | —                      | Coordinator, DI container, data adapter, lifecycle management      |
 | **UI**         | `UI/`         | `UI/AGENTS.md`         | SwiftUI interface (timeline, dashboard, settings, search)          |
@@ -317,6 +334,17 @@ DATABASE Module:
 SEARCH Module:
   Input:  Query string (with filters: app:, date:, -exclude)
   Output: SearchResult[] with frameId + snippet + highlighting
+
+SEMANTIC SEARCH (optional, off by default):
+  Indexing: SemanticIndexer walks indexed frames (newest first, then history), per kind:
+            text       OCR text + window title            (tens of ms a frame)
+            image      the screenshot, once OCR is done and any redaction is burned in   (0.24–0.34 s a frame measured, on power)
+            → RetraceEmbeddingHelper (EmbeddingGemma 2 on llama.cpp, separate process)
+            → 256-dim float16 vector per frame and kind in frame_embedding
+  Query:    SemanticSearchService embeds the query, scores every vector (held in memory around searches), returns
+            frames that stand out
+            → DataAdapter.search applies the query's filters and adds them to page 1 of the results
+              (Relevance order: reciprocal rank fusion with the keyword order; date order: after the keyword matches)
 ```
 
 ### Database Relationships
@@ -366,7 +394,7 @@ frame (1) ──< (1) doc_segment >── (1) searchRanking_content
 | Database            | SQLite + FTS5           | Full-text search built-in              |
 | Encryption          | CryptoKit (AES-256-GCM) | Optional on-device encryption          |
 | Audio Transcription | whisper.cpp             | Planned (bundled but disabled)         |
-| Vector Search       | llama.cpp               | Planned (prepared but not active)      |
+| Semantic Search     | EmbeddingGemma 2 on llama.cpp | Optional; llama.cpp built by scripts/build_llama_embedding.sh; helper built by SwiftPM when that library exists (always by the Xcode project) |
 
 ---
 
@@ -497,4 +525,4 @@ Then check which path actually executes and fix the right code.
 
 ---
 
-_This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2026-04-14_
+_This file follows the AGENTS.md standard for AI agent guidance. Last updated: 2026-11-12_

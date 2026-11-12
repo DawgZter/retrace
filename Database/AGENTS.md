@@ -33,17 +33,21 @@ Database/
 │   ├── V16_ProcessingQueueFrameIDIndex.swift
 │   ├── V17_FrameCaptureTrigger.swift
 │   ├── V18_DailyMetricsRecencyIndex.swift
-│   └── V19_FrameEncodedAt.swift
+│   ├── V19_FrameEncodedAt.swift
+│   └── V20_FrameEmbeddings.swift # frame_embedding table (semantic search vectors) + cleanup triggers
 ├── Queries/
 │   ├── FrameQueries.swift     # Frame CRUD operations
 │   ├── SegmentQueries.swift   # Segment CRUD operations
 │   ├── DailyMetricsQueries.swift # Metric events and local-day counts, with optional exact timestamp bounds
-│   └── DocumentQueries.swift  # Document/FTS operations
+│   ├── DocumentQueries.swift  # Document/FTS operations
+│   └── EmbeddingQueries.swift # frame_embedding SQL (indexer cursors, guarded writes, reads, deletes) + DatabaseManager's EmbeddingStoreProtocol conformance
 └── Tests/
     ├── AsyncQueuePipelineTests.swift
     ├── DatabaseManagerTests.swift
     ├── EdgeCaseTests.swift
     ├── FTSManagerTests.swift
+    ├── FrameEmbeddingTests.swift # V20 migration, indexer cursors, guarded writes and cleanup triggers (real SQLite)
+    ├── FrameEmbeddingLoadBenchmarks.swift # Opt-in: time to read N stored vectors into memory
     ├── IntegrationTests.swift
     ├── OCRPipelineTests.swift
     ├── QueryBuilderTests.swift
@@ -62,6 +66,11 @@ Database/
 - Full-text search queries
 - Match counting
 - Index maintenance
+
+### 3. `EmbeddingStoreProtocol` (from `Shared/Protocols/SemanticSearchProtocol.swift`)
+- Storage for semantic search vectors in the `frame_embedding` table (V20)
+- `DatabaseManager` conforms in `Queries/EmbeddingQueries.swift`
+- A vector is written only if its frame still has the document and text it was made from; a screenshot vector also needs the frame's pixels to be final
 
 ## Schema Design
 
@@ -481,6 +490,7 @@ Existing databases upgrade forward in migration order. Recent frame-pipeline mig
 - V17: `capture_trigger`
 - V18: `daily_metrics` recency index
 - V19: `encodedAt`
+- V20: `frame_embedding` table + cleanup triggers
 
 New installations get the current schema plus all migrations applied during initialization.
 
