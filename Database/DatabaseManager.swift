@@ -992,6 +992,9 @@ public actor DatabaseManager: DatabaseProtocol {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
         try DocumentQueries.update(db: db, id: id, content: content)
+        // A semantic search vector made from the old text must not outlive it. Replacing a document deletes its
+        // vectors through a trigger; an update in place has to say so itself.
+        try EmbeddingQueries.requeue(db: db, docID: id)
     }
 
     public func deleteDocument(id: Int64) async throws {
