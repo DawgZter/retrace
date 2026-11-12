@@ -9,7 +9,8 @@
 #   Vendors/llamacpp/BUILD_STAMP      the tag, patch hash and deployment target this build was made from
 #
 # Package.swift adds the helper target only when that library exists, so `swift build` works without running this:
-# the app then builds without semantic search.
+# the app then builds without semantic search. This script ends by clearing SwiftPM's manifest cache (see
+# clear_swiftpm_manifest_cache below), so that the next `swift build` sees the library.
 #
 # The approach (pinned tag, the no-logits patch, embedded Metal shaders) follows DigUp's scripts/build-llama.sh
 # (https://github.com/ARahim3/DigUp, MIT).
@@ -26,9 +27,23 @@ SOURCE="${LLAMA_SOURCE:-$PWD/Vendors/llamacpp/source}"
 BUILD="${LLAMA_BUILD:-$PWD/Vendors/llamacpp/cmake-build}"
 OUT="$PWD/Vendors/llamacpp"
 
+# SwiftPM caches each evaluated Package.swift in ~/Library/Caches/org.swift.swiftpm/manifests/manifest.db. The cache key
+# is the manifest's text and the environment, not the files the manifest looks at, so a Package.swift evaluated before
+# libllamacpp.a existed keeps reporting no RetraceEmbeddingHelper target, and `swift build` keeps skipping the helper,
+# until that entry is gone. (`swift package --manifest-cache none describe` shows what a fresh evaluation gives.)
+# SwiftPM has no command that drops one package's entry. `swift package purge-cache` removes this same database but
+# also every cached dependency clone on the machine, so this removes only the database: SwiftPM recreates it and
+# evaluates each manifest again, once, the next time it is needed.
+# This runs when the library was already built too, so running the script again is the fix for a missing helper target.
+clear_swiftpm_manifest_cache() {
+  local db="$HOME/Library/Caches/org.swift.swiftpm/manifests/manifest.db"
+  rm -f "$db" "$db-shm" "$db-wal"
+}
+
 STAMP="$TAG $(shasum -a 256 "$PATCH" | cut -c1-12) macos$DEPLOYMENT_TARGET mtmd"
 if [[ -f "$OUT/lib/libllamacpp.a" && "$(cat "$OUT/BUILD_STAMP" 2>/dev/null)" == "$STAMP" ]]; then
   echo "llama.cpp $TAG is already built in Vendors/llamacpp"
+  clear_swiftpm_manifest_cache
   exit 0
 fi
 
@@ -79,4 +94,5 @@ while IFS= read -r lib; do LIBS+=("$lib"); done < <(find "$BUILD" -name '*.a' \
 xcrun libtool -static -no_warning_for_no_symbols -o "$OUT/lib/libllamacpp.a" "${LIBS[@]}"
 cp "$SOURCE/include/llama.h" "$SOURCE/tools/mtmd/mtmd.h" "$SOURCE"/ggml/include/*.h "$OUT/include/"
 echo "$STAMP" > "$OUT/BUILD_STAMP"
+clear_swiftpm_manifest_cache
 echo "Built llama.cpp $TAG (patched, Metal, macOS $DEPLOYMENT_TARGET+) into Vendors/llamacpp"

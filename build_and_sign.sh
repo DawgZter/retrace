@@ -88,6 +88,18 @@ if [ ! -f "$CRASH_RECOVERY_PLIST" ]; then
 fi
 
 cp "$CRASH_RECOVERY_HELPER" "$APP_BUNDLE/Contents/Library/Helpers/RetraceCrashRecoveryHelper"
+
+# Semantic search runs its model in RetraceEmbeddingHelper, which SwiftPM builds only when llama.cpp has been
+# built (scripts/build_llama_embedding.sh). Without it the app works and reports semantic search as unavailable.
+EMBEDDING_HELPER="$BUILD_DIR/RetraceEmbeddingHelper"
+if [ -f "$EMBEDDING_HELPER" ]; then
+    cp "$EMBEDDING_HELPER" "$APP_BUNDLE/Contents/Library/Helpers/RetraceEmbeddingHelper"
+    # The helper contains llama.cpp and code ported from DigUp: their licence notices ship with it.
+    cp THIRD_PARTY_NOTICES.md "$APP_BUNDLE/Contents/Resources/THIRD_PARTY_NOTICES.md"
+else
+    echo "ℹ️  RetraceEmbeddingHelper not built: semantic search will be unavailable in this bundle."
+    echo "   Run scripts/build_llama_embedding.sh and build again to include it."
+fi
 cp "$CRASH_RECOVERY_PLIST" \
     "$APP_BUNDLE/Contents/Library/LaunchAgents/io.retrace.app.crash-recovery.plist"
 
@@ -143,6 +155,9 @@ done
 # Sign nested helper executables before the containing app.
 if [ -f "$APP_BUNDLE/Contents/Library/Helpers/RetraceCrashRecoveryHelper" ]; then
     codesign --force --sign - "$APP_BUNDLE/Contents/Library/Helpers/RetraceCrashRecoveryHelper"
+fi
+if [ -f "$APP_BUNDLE/Contents/Library/Helpers/RetraceEmbeddingHelper" ]; then
+    codesign --force --sign - "$APP_BUNDLE/Contents/Library/Helpers/RetraceEmbeddingHelper"
 fi
 
 # Sign the app bundle with ad-hoc signature and entitlements

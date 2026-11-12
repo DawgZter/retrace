@@ -42,8 +42,17 @@ targets:
           copyFiles:
             destination: wrapper
             subpath: Contents/Library/LaunchAgents
+      # Licence notices for llama.cpp and the code ported from DigUp, both inside RetraceEmbeddingHelper.
+      - path: THIRD_PARTY_NOTICES.md
+        buildPhase: resources
     dependencies:
       - target: RetraceCrashRecoveryHelper
+        embed: true
+        codeSign: true
+        copy:
+          destination: wrapper
+          subpath: Contents/Library/Helpers
+      - target: RetraceEmbeddingHelper
         embed: true
         codeSign: true
         copy:
@@ -95,6 +104,38 @@ targets:
         DEVELOPMENT_TEAM: 5X5W7C3L9D
         CODE_SIGNING_REQUIRED: YES
         CODE_SIGNING_ALLOWED: YES
+
+  # Semantic search's embedding model, as a child process. Links the llama.cpp static library that
+  # scripts/build_llama_embedding.sh builds into Vendors/llamacpp (run it before generating the project).
+  RetraceEmbeddingHelper:
+    type: tool
+    platform: macOS
+    sources:
+      - path: Sources/RetraceEmbeddingHelper
+    # Without the library the build would stop at an obscure "llama.h not found" or linker error: say what to do instead.
+    preBuildScripts:
+      - name: Check llama.cpp is built
+        basedOnDependencyAnalysis: false
+        script: |
+          if [ ! -f "${SRCROOT}/Vendors/llamacpp/lib/libllamacpp.a" ]; then
+            echo "error: Vendors/llamacpp/lib/libllamacpp.a is missing: run scripts/build_llama_embedding.sh, then build again"
+            exit 1
+          fi
+    settings:
+      base:
+        PRODUCT_NAME: RetraceEmbeddingHelper
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: io.retrace.app.embeddinghelper
+        SKIP_INSTALL: YES
+        SWIFT_INCLUDE_PATHS: "$(SRCROOT)/Sources/CLlamaEmbedding"
+        LIBRARY_SEARCH_PATHS: "$(SRCROOT)/Vendors/llamacpp/lib"
+        OTHER_LDFLAGS: "-lllamacpp -lc++ -framework Accelerate -framework Metal -framework MetalKit"
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "Developer ID Application"
+        DEVELOPMENT_TEAM: 5X5W7C3L9D
+        CODE_SIGNING_REQUIRED: YES
+        CODE_SIGNING_ALLOWED: YES
+        ENABLE_HARDENED_RUNTIME: YES
 
   CrashRecoverySupport:
     type: framework

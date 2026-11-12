@@ -82,6 +82,12 @@ echo -e "${YELLOW}Preflight: Running sleep API guard...${NC}"
 ./scripts/check_no_nanoseconds_sleep.sh
 echo -e "${GREEN}  Sleep API guard passed${NC}"
 
+# The RetraceEmbeddingHelper target links llama.cpp from Vendors/llamacpp (not tracked by git).
+# Built here, before project.yml is touched, so a failed llama.cpp build leaves nothing modified.
+echo -e "${YELLOW}Preflight: Building llama.cpp for the semantic search helper...${NC}"
+./scripts/build_llama_embedding.sh
+echo -e "${GREEN}  llama.cpp ready${NC}"
+
 # Create releases directory
 mkdir -p "$RELEASES_DIR"
 
