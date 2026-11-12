@@ -2071,6 +2071,8 @@ public class TimelineWindowController: NSObject {
             let viewModel = await self.awaitTimelineViewModelReady()
 
             Log.info("[DeeplinkSearch] Invocation #\(invocationID) applying deeplink payload", category: .ui)
+            // A deeplink searches straight away: start loading the semantic index and model now
+            self.coordinator?.prepareSemanticSearch()
             viewModel.applySearchDeeplink(query: query, appBundleID: appBundleID, source: source)
         }
     }
@@ -2127,6 +2129,8 @@ public class TimelineWindowController: NSObject {
 
         if !wasVisible, let coordinator {
             DashboardViewModel.recordSearchDialogOpen(coordinator: coordinator)
+            // Load the semantic index and model now, so the first search doesn't wait for them
+            coordinator.prepareSemanticSearch()
         }
 
         return !wasVisible

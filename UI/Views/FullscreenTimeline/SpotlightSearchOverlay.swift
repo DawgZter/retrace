@@ -1989,6 +1989,18 @@ private struct GalleryResultCard: View {
                                 .padding(.vertical, 2)
                                 .background(result.source == .native ? RetraceMenuStyle.actionBlue.opacity(0.2) : Color.purple.opacity(0.2))
                                 .cornerRadius(3)
+
+                            // Found by semantic search: the query's words weren't on screen
+                            if result.isSemanticOnly {
+                                Text("Meaning")
+                                    .font(.retraceTinyBold)
+                                    .foregroundColor(.orange)
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 2)
+                                    .background(Color.orange.opacity(0.2))
+                                    .cornerRadius(3)
+                                    .help("Matched by meaning: the words you typed weren't on screen")
+                            }
                         }
 
                         // Timestamp and relevance

@@ -214,6 +214,8 @@ final class SettingsShellViewModel: ObservableObject {
             searchableText: ["app filter", "skip ocr", "ocr apps", "filter apps", "power saving"]),
         SettingsSearchEntry(id: "tags.manageTags", tab: .tags, cardTitle: "Manage Tags", cardIcon: "tag",
             searchableText: ["manage tags", "create tag", "delete tag", "tag name", "organize"]),
+        SettingsSearchEntry(id: "advanced.semanticSearch", tab: .advanced, cardTitle: "Semantic Search", cardIcon: "sparkle.magnifyingglass",
+            searchableText: ["semantic search", "search by meaning", "embeddings", "natural language", "model download", "index"]),
         SettingsSearchEntry(id: "advanced.cache", tab: .advanced, cardTitle: "Cache", cardIcon: "externaldrive",
             searchableText: ["cache", "clear cache", "app name cache", "refresh"]),
         SettingsSearchEntry(id: "advanced.timeline", tab: .advanced, cardTitle: "Timeline", cardIcon: "play.rectangle",

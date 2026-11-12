@@ -14,6 +14,7 @@ import UniformTypeIdentifiers
 extension SettingsView {
     var advancedSettings: some View {
         VStack(alignment: .leading, spacing: 20) {
+            semanticSearchCard
             cacheCard
             timelineCard
             developerCard
@@ -22,6 +23,11 @@ extension SettingsView {
     }
 
     // MARK: - Advanced Cards (extracted for search)
+
+    @ViewBuilder
+    var semanticSearchCard: some View {
+        SemanticSearchSettingsCard(coordinator: coordinatorWrapper.coordinator)
+    }
 
     @ViewBuilder
     var cacheCard: some View {

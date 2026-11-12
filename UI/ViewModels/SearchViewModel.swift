@@ -278,7 +278,15 @@ public class SearchViewModel: ObservableObject {
     @Published public var availableTags: [Tag] = []  // Available tags for filter dropdown
 
     // Search mode (tabs)
-    @Published public var searchMode: SearchMode = .all
+    @Published public var searchMode: SearchMode = SearchViewModel.defaultSearchMode
+
+    /// The order a search starts in. With semantic search on and able to run (helper in this build, model
+    /// downloaded), results are ranked by relevance: that is the only order in which matches found by meaning
+    /// are ranked together with keyword matches, and a date order says nothing about how well a description
+    /// fits. Otherwise the default stays newest first, as before.
+    public static var defaultSearchMode: SearchMode {
+        ServiceContainer.isSemanticSearchUsable ? .relevant : .all
+    }
 
     // Sort order (for "all" mode)
     @Published public var sortOrder: SearchSortOrder = .newestFirst
@@ -1636,11 +1644,25 @@ public class SearchViewModel: ObservableObject {
             // Check for cancellation before starting
             try Task.checkCancellation()
 
-            let query = buildSearchQuery(searchQuery, offset: 0, cursor: nextPageCursor)
-            let moreResults = try await executeSearch(query)
-
-            // Check for cancellation after the search completes
+            // A frame that semantic search showed on the first page can come back as a keyword match on a later
+            // one, and is shown once. If a whole page turns out to be frames already shown, nothing would be
+            // appended and the scroll trigger (the last cards appearing) would never fire again, so the next
+            // page is fetched straight away, until one brings something new or there are no more. Only the
+            // first page's semantic results can repeat, so this ends; the limit and the check that the cursor
+            // moved are there in case a source ever returns the same page twice.
+            let shownResults = Set(currentResults.results.map { "\($0.source)-\($0.id.value)" })
+            var moreResults = try await executeSearch(buildSearchQuery(searchQuery, offset: 0, cursor: nextPageCursor))
             try Task.checkCancellation()
+            var pagesSkipped = 0
+            var cursorUsed = nextPageCursor
+            while let cursor = moreResults.nextCursor, cursor != cursorUsed, pagesSkipped < 100,
+                  !moreResults.results.isEmpty,
+                  moreResults.results.allSatisfy({ shownResults.contains("\($0.source)-\($0.id.value)") }) {
+                pagesSkipped += 1
+                cursorUsed = cursor
+                moreResults = try await executeSearch(buildSearchQuery(searchQuery, offset: 0, cursor: cursor))
+                try Task.checkCancellation()
+            }
 
             Log.info("[SearchViewModel] Loaded \(moreResults.results.count) more results", category: .ui)
 
@@ -1657,8 +1679,9 @@ public class SearchViewModel: ObservableObject {
                 return
             }
 
-            // Append new results to existing
-            let combinedResults = currentResults.results + moreResults.results
+            // Append new results to existing, each frame once (result identity must stay unique).
+            let combinedResults = currentResults.results
+                + moreResults.results.filter { !shownResults.contains("\($0.source)-\($0.id.value)") }
             results = SearchResults(
                 query: moreResults.query,
                 results: combinedResults,
@@ -1971,7 +1994,7 @@ public class SearchViewModel: ObservableObject {
     }
 
     public func resetSearchOrderToDefault() {
-        searchMode = .all
+        searchMode = Self.defaultSearchMode
         sortOrder = .newestFirst
     }
 

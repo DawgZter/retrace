@@ -86,6 +86,7 @@ UI/
 │           ├── PowerSettingsView.swift
 │           ├── TagManagementSettingsView.swift
 │           ├── AdvancedSettingsView.swift
+│           ├── SemanticSearchSettingsView.swift # Semantic Search card (Advanced tab + settings search); observes the shared SemanticSearchSettingsModel
 │           ├── SettingsFeedbackActions.swift
 │           ├── SettingsUtilityActions.swift
 │           └── SettingsLaunchAndResetActions.swift
@@ -139,7 +140,8 @@ UI/
 │       ├── PrivacySettingsViewModel.swift
 │       ├── PowerSettingsViewModel.swift
 │       ├── TagsSettingsViewModel.swift
-│       └── AdvancedSettingsViewModel.swift
+│       ├── AdvancedSettingsViewModel.swift
+│       └── SemanticSearchSettingsModel.swift # One per AppCoordinator, outlives the card: switches, download-then-enable, reset, status polling pace
 └── Tests/
     ├── BuildInfoAndUpdaterTests.swift    # Build metadata formatting + updater version fallback tests
     ├── CommentComposerTargetContextTests.swift # Comment-target utilities and quick-comment persisted-preview source coverage
@@ -156,6 +158,7 @@ UI/
     ├── SearchViewModelAvailableAppsTests.swift # Search app-list merge/deduplication coverage
     ├── SpotlightSearchOverlayRecentEntryAppMapTests.swift # Recent entry app-name map deduplication coverage
     ├── Search/SearchPaginationCancellationTests.swift # Search stale-pagination cancellation coverage on mode/sort changes
+    ├── Search/SearchLoadMoreDeduplicationTests.swift # A later page repeating frames already shown: no repeats, no stalled scrolling
     ├── DashboardAppUsageDateRangeTests.swift # Dashboard date/time range normalization and cache coverage
     ├── DashboardRevealSchedulerTests.swift # Activation/URL ordering, cancellation, and later Dock reopen coverage
     ├── DateRangePresetShortcutTests.swift # Date/time parsing, round-trip formatting, full-day bounds, and preset shortcuts
@@ -167,6 +170,7 @@ UI/
     ├── MenuBar/                          # Menu bar interaction tests
     ├── Search/                           # Search/deeplink/overlay XCTestCase files
     ├── Settings/                         # Settings-focused XCTestCase files, including shell/view-model coverage
+    │   └── SemanticSearchSettingsModelTests.swift # Download-then-enable without a card, stop/reset, metrics-neutral reset, status polling pace
     ├── Support/                          # Shared XCTest helpers and support-only tests
     │   └── FocusableTextInputSupportTests.swift # Borderless text-input keyboard shortcut, right-click deferral, and menu-filter coverage
     ├── SystemMonitor/                    # System monitor XCTestCase files

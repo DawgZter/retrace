@@ -518,5 +518,10 @@ extension SettingsView {
         enableFrameIDSearch = SettingsDefaults.enableFrameIDSearch
         showVideoControls = SettingsDefaults.showVideoControls
         showMenuBarCaptureFeedback = SettingsDefaults.showMenuBarCaptureFeedback
+
+        // Semantic search is off by default. The index and the downloaded models are kept; "Remove Index"
+        // deletes the vectors. A download still running is stopped and turns nothing on. Only a switch that
+        // was on is turned off (and recorded as turned off).
+        SemanticSearchSettingsModel.shared(for: coordinatorWrapper.coordinator).resetToDefaults()
     }
 }

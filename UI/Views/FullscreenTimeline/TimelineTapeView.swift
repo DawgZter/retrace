@@ -1584,6 +1584,8 @@ struct SearchButton: View {
             viewModel.openSearchOverlay(recentEntriesRevealDelay: 0.3)
             // Record search dialog open metric
             DashboardViewModel.recordSearchDialogOpen(coordinator: coordinatorWrapper.coordinator)
+            // Load the semantic index and model now, so the first search doesn't wait for them
+            coordinatorWrapper.coordinator.prepareSemanticSearch()
         }) {
             HStack(spacing: TimelineScaleFactor.iconSpacing) {
                 Image(systemName: "magnifyingglass")
