@@ -3530,7 +3530,9 @@ public actor AppCoordinator {
         // Try DataAdapter first (routes to Rewind if available)
         if let adapter = await services.dataAdapter {
             do {
-                return try await adapter.search(query: query)
+                let results = try await adapter.search(query: query)
+                recordSemanticSearchMetricIfNeeded(for: results)
+                return results
             } catch {
                 Log.warning(
                     "[AppCoordinator] DataAdapter search failed, falling back to FTS: \(error)",
@@ -3541,6 +3543,155 @@ public actor AppCoordinator {
 
         // Fallback to native FTS search
         return try await services.search.search(query: query)
+    }
+
+    // MARK: - Semantic Search
+
+    /// Records, for every first page searched with semantic search able to run, how many results came from
+    /// meaning alone (zero included, so the share of searches it helped can be worked out).
+    private nonisolated func recordSemanticSearchMetricIfNeeded(for results: SearchResults) {
+        guard results.query.cursor == nil, results.query.offset == 0,
+              ServiceContainer.isSemanticSearchUsable else { return }
+        let semanticOnly = results.results.filter(\.isSemanticOnly).count
+        let metadata = Self.metricMetadata([
+            "mode": results.query.mode.rawValue,
+            "keywordResults": results.results.count - semanticOnly,
+            "semanticOnlyResults": semanticOnly
+        ])
+        Task {
+            try? await self.recordMetricEvent(metricType: .semanticSearchResults, metadata: metadata)
+        }
+    }
+
+    /// Looking for the helper checks several places on disk. It is part of the build, so it can't appear or
+    /// go away while the app runs: the answer is worked out once and kept.
+    private static let hasSemanticSearchHelper = ServiceContainer.hasSemanticSearchHelper
+
+    /// Whether this build can run the embedding model (the helper is built only when llama.cpp was).
+    /// The first read in a process touches the disk: on the main thread, await
+    /// `semanticSearchAvailabilityInBuild()` instead.
+    public nonisolated var isSemanticSearchAvailableInBuild: Bool {
+        Self.hasSemanticSearchHelper
+    }
+
+    /// `isSemanticSearchAvailableInBuild`, worked out off the caller's thread.
+    public nonisolated func semanticSearchAvailabilityInBuild() async -> Bool {
+        Self.hasSemanticSearchHelper
+    }
+
+    public nonisolated var isSemanticSearchEnabled: Bool {
+        SemanticSearchSettings.isEnabled
+    }
+
+    /// Turns semantic search on or off. The indexer notices within a few seconds: turning it off frees the
+    /// vectors in memory and stops the model; stored vectors are kept until `removeSemanticIndex()`.
+    /// Setting the position it already has does nothing (and records nothing).
+    public nonisolated func setSemanticSearchEnabled(_ enabled: Bool) {
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        guard defaults.bool(forKey: SemanticSearchSettings.enabledDefaultsKey) != enabled else { return }
+        defaults.set(enabled, forKey: SemanticSearchSettings.enabledDefaultsKey)
+        Task {
+            try? await self.recordMetricEvent(metricType: .semanticSearchToggled, metadata: enabled ? "on" : "off")
+        }
+    }
+
+    /// The position of the screenshots switch. Screenshots are indexed only while semantic search is also on.
+    public nonisolated var isSemanticImagesEnabled: Bool {
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        return defaults.bool(forKey: SemanticSearchSettings.imagesEnabledDefaultsKey)
+    }
+
+    /// Turns embedding of screenshots on or off (it only runs while semantic search itself is on).
+    /// Setting the position it already has does nothing (and records nothing).
+    public nonisolated func setSemanticImagesEnabled(_ enabled: Bool) {
+        let defaults = UserDefaults(suiteName: "io.retrace.app") ?? .standard
+        guard defaults.bool(forKey: SemanticSearchSettings.imagesEnabledDefaultsKey) != enabled else { return }
+        defaults.set(enabled, forKey: SemanticSearchSettings.imagesEnabledDefaultsKey)
+        Task {
+            try? await self.recordMetricEvent(
+                metricType: .semanticSearchToggled,
+                metadata: enabled ? "images_on" : "images_off"
+            )
+        }
+    }
+
+    /// The models semantic search can download: the text model (always needed) and the image encoder.
+    public enum SemanticModel: String, Sendable {
+        case text
+        case imageEncoder
+
+        var info: ModelManager.ModelInfo {
+            switch self {
+            case .text: return ModelManager.embeddingModel
+            case .imageEncoder: return ModelManager.imageEncoderModel
+            }
+        }
+    }
+
+    public nonisolated func isSemanticModelDownloaded(_ model: SemanticModel = .text) async -> Bool {
+        await services.modelManager.getModelStatus(model.info).isValid
+    }
+
+    /// Size of a model download for the Settings description, in megabytes as Finder shows them
+    /// (1 MB = 1,000,000 bytes).
+    public nonisolated func semanticModelSizeMB(_ model: SemanticModel = .text) -> Int {
+        model.info.sizeMB
+    }
+
+    /// Downloads a model (once; callers asking for the same model at the same time share one download).
+    /// `progress` is called with 0…1 a few times a second, on any thread.
+    /// Cancelling the calling task throws `CancellationError`, which is not a failure: it is recorded as
+    /// `<model>_cancelled`.
+    public nonisolated func downloadSemanticModel(
+        _ model: SemanticModel = .text,
+        progress: @escaping @Sendable (Double) -> Void
+    ) async throws {
+        do {
+            _ = try await services.modelManager.downloadModel(model.info) { update in
+                progress(update.percentage)
+            }
+            try? await recordMetricEvent(metricType: .semanticModelDownload, metadata: "\(model.rawValue)_succeeded")
+        } catch {
+            let cancelled = ModelManager.isCancellation(error)
+            try? await recordMetricEvent(
+                metricType: .semanticModelDownload,
+                metadata: "\(model.rawValue)_\(cancelled ? "cancelled" : "failed")"
+            )
+            throw cancelled ? CancellationError() : error
+        }
+    }
+
+    /// Indexing progress, or `.off` before services are up.
+    public nonisolated func semanticSearchStatus() async -> SemanticIndexStatus {
+        guard let indexer = await services.semanticIndexer else {
+            return SemanticIndexStatus(state: .off, embeddedFrames: 0, indexedFrames: 0)
+        }
+        return await indexer.status()
+    }
+
+    /// Deletes every stored vector and frees the ones in memory. With semantic search still on, indexing starts over.
+    public nonisolated func removeSemanticIndex() async throws {
+        // Indexing is stopped first and resumed after, so a batch in flight can't write vectors back.
+        let indexer = await services.semanticIndexer
+        await indexer?.stopAndWait()
+        do {
+            try await services.database.deleteAllFrameEmbeddings(kind: nil)
+            await services.semanticSearch?.unload()
+            await indexer?.start()
+            try? await recordMetricEvent(metricType: .semanticIndexRemoved, metadata: "succeeded")
+        } catch {
+            await indexer?.start()
+            try? await recordMetricEvent(metricType: .semanticIndexRemoved, metadata: "failed")
+            throw error
+        }
+    }
+
+    /// Loads the vectors and the model ahead of a search, so the first query doesn't wait for them.
+    public nonisolated func prepareSemanticSearch() {
+        guard SemanticSearchSettings.isEnabled else { return }
+        Task(priority: .userInitiated) {
+            await services.semanticSearch?.prepareForSearch()
+        }
     }
 
     // MARK: - Frame Retrieval

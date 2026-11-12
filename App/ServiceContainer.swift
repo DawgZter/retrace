@@ -1,4 +1,6 @@
+import CoreGraphics
 import Foundation
+import os
 import Shared
 import Database
 import Storage
@@ -33,6 +35,9 @@ public actor ServiceContainer {
     public let retentionManager: RetentionManager
     public var dataAdapter: DataAdapter?
     public var processingQueue: FrameProcessingQueue?
+    /// Search by meaning. Created during `initialize()`; does nothing until enabled in Settings.
+    public private(set) var semanticSearch: SemanticSearchService?
+    public private(set) var semanticIndexer: SemanticIndexer?
 
     // MARK: - Configuration
 
@@ -353,6 +358,54 @@ public actor ServiceContainer {
         try await adapter.initialize()
         self.dataAdapter = adapter
         Log.info("✓ DataAdapter initialized", category: .app)
+
+        // 9b. Semantic search: embeds OCR text in the background and adds meaning matches to search results.
+        // Off until enabled in Settings; without the helper executable or the model it reports why and waits.
+        let helperURL = EmbeddingHelperClient.locateHelper()
+        let embeddingModelPath = Self.semanticModelURL.path
+        let missingHelperURL = URL(fileURLWithPath: "/nonexistent/RetraceEmbeddingHelper")
+        let embedder = EmbeddingHelperClient(
+            helperURL: helperURL ?? missingHelperURL,
+            modelPath: embeddingModelPath
+        )
+        // Screenshots get a helper of their own: it also holds the image encoder (about a gigabyte), so it runs
+        // only while there are screenshots to embed, and never for a search.
+        let imageEmbedder = EmbeddingHelperClient(
+            helperURL: helperURL ?? missingHelperURL,
+            modelPath: embeddingModelPath,
+            mediaModelPath: Self.semanticImageModelURL.path,
+            idleTimeout: 60
+        )
+        let semanticService = SemanticSearchService(
+            store: database,
+            embedder: embedder,
+            imageEmbedder: imageEmbedder,
+            // An extractor of its own, so its decoder cache can be dropped before every batch without slowing
+            // the timeline's.
+            imageProvider: StorageFrameImageProvider(extractor: HEVCStorageExtractor(storageManager: storage))
+        )
+        let indexer = SemanticIndexer(
+            store: database,
+            service: semanticService,
+            isReady: { kind in
+                let hasModel = FileManager.default.fileExists(atPath: embeddingModelPath)
+                Self.semanticSearchCanRun.withLock { $0 = helperURL != nil && hasModel }
+                if helperURL == nil { return .helperMissing }
+                guard hasModel else { return .modelMissing }
+                if kind == .image, !FileManager.default.fileExists(atPath: Self.semanticImageModelURL.path) {
+                    return .modelMissing
+                }
+                return nil
+            }
+        )
+        Self.semanticSearchCanRun.withLock {
+            $0 = helperURL != nil && FileManager.default.fileExists(atPath: embeddingModelPath)
+        }
+        self.semanticSearch = semanticService
+        self.semanticIndexer = indexer
+        await adapter.setSemanticSearch(semanticService)
+        await indexer.start()
+        Log.info("✓ Semantic search ready (helper: \(helperURL == nil ? "missing" : "found"))", category: .app)
 
         // 10. Start retention manager (runs periodic cleanup based on user settings)
         await retentionManager.start()
@@ -675,6 +728,12 @@ public actor ServiceContainer {
         await retentionManager.stop()
         Log.info("✓ Retention manager stopped", category: .app)
 
+        // Stop semantic indexing and the embedding helper before the database closes. Wait for the batch in
+        // flight, so nothing is written to a database that is being closed.
+        await semanticIndexer?.stopAndWait()
+        await semanticSearch?.unload()
+        Log.info("✓ Semantic search stopped", category: .app)
+
         // Shutdown DataAdapter (disconnects all sources)
         await dataAdapter?.shutdown()
         closeOwnedRewindConnection()
@@ -689,6 +748,37 @@ public actor ServiceContainer {
         isInitialized = false
         Log.info("All services shutdown successfully", category: .app)
     }
+
+    // MARK: - Semantic Search
+
+    /// Where the embedding model is kept (inside the storage root, with any other downloaded models).
+    public static var semanticModelURL: URL {
+        URL(fileURLWithPath: AppPaths.expandedStorageRoot)
+            .appendingPathComponent("models")
+            .appendingPathComponent(SemanticSearchSettings.modelFileName)
+    }
+
+    /// Where the image encoder is kept (only needed when screenshots are embedded too).
+    public static var semanticImageModelURL: URL {
+        URL(fileURLWithPath: AppPaths.expandedStorageRoot)
+            .appendingPathComponent("models")
+            .appendingPathComponent(SemanticSearchSettings.imageModelFileName)
+    }
+
+    /// Whether this build contains the embedding helper (it is built only when llama.cpp was). Looked up once:
+    /// the answer can't change while the app runs.
+    public static let hasSemanticSearchHelper: Bool = EmbeddingHelperClient.locateHelper() != nil
+
+    /// Whether a search can use semantic matches right now: turned on, the helper is in this build, and the
+    /// model has been downloaded. Safe to read on the main thread: it never touches the disk. The helper and
+    /// the model file are looked for when the services start and by the indexer every few seconds, off the
+    /// main thread, and the answer is remembered here.
+    public static var isSemanticSearchUsable: Bool {
+        SemanticSearchSettings.isEnabled && semanticSearchCanRun.withLock { $0 }
+    }
+
+    /// The helper is in this build and the model file is in place, as last checked.
+    private static let semanticSearchCanRun = OSAllocatedUnfairLock(initialState: false)
 
     // MARK: - Service Access
 
@@ -725,6 +815,29 @@ public actor ServiceContainer {
     /// Get processing statistics
     public func getProcessingStats() async -> ProcessingStatistics {
         await processing.getStatistics()
+    }
+}
+
+// MARK: - Semantic Search Support
+
+/// Reads a frame's screenshot from Retrace's video storage, for the image encoder.
+struct StorageFrameImageProvider: FrameImageProviding {
+    struct MissingVideo: Error {}
+
+    let extractor: any ImageExtractor
+
+    func frameImage(for source: FrameEmbeddingSource) async throws -> CGImage {
+        guard let videoPath = source.videoPath else { throw MissingVideo() }
+        return try await extractor.extractFrameCGImage(
+            videoPath: videoPath,
+            frameIndex: source.frameIndex,
+            frameRate: source.videoFrameRate
+        )
+    }
+
+    func discardCachedFrames() {
+        (extractor as? FrameExtractionCacheInvalidating)?
+            .purgeFrameExtractionCaches(reason: "semantic image batch")
     }
 }
 

@@ -47,6 +47,10 @@ public enum DailyMetricsQueries {
         case searchDialogOpens = "search_dialog_opens"
         case timelineAutoDismissed = "timeline_auto_dismissed"  // metadata: JSON {trigger: "app_activation", activatedBundleID?}
         case ocrReprocessRequests = "ocr_reprocess_requests"
+        case semanticSearchResults = "semantic_search_results"  // metadata: JSON {mode, keywordResults, semanticOnlyResults}
+        case semanticSearchToggled = "semantic_search_toggled"  // metadata: "on", "off", "images_on" or "images_off"
+        case semanticIndexRemoved = "semantic_index_removed"  // metadata: "succeeded" or "failed"
+        case semanticModelDownload = "semantic_model_download"  // metadata: "<text|imageEncoder>_<succeeded|failed|cancelled>"
         case arrowKeyNavigation = "arrow_key_navigation"  // metadata: "left" or "right"
         case shiftDragZoomRegion = "shift_drag_zoom_region"  // metadata: JSON {region, screenSize}
         case shiftDragTextCopy = "shift_drag_text_copy"  // metadata: copied text

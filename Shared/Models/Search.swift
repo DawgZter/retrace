@@ -223,6 +223,9 @@ public struct SearchResult: Codable, Sendable, Identifiable {
     public let videoFrameRate: Double?    // Video frame rate for precise seek
     public var source: FrameSource        // Which data source this result came from
     public let highlightNode: HighlightNode?
+    /// Set when semantic search found this frame: how far its meaning stands out for the query, in standard
+    /// deviations. Nil for a result found by keywords alone.
+    public let semanticScore: Double?
 
     public init(
         id: FrameID,
@@ -237,7 +240,8 @@ public struct SearchResult: Codable, Sendable, Identifiable {
         videoPath: String? = nil,
         videoFrameRate: Double? = nil,
         source: FrameSource = .native,
-        highlightNode: HighlightNode? = nil
+        highlightNode: HighlightNode? = nil,
+        semanticScore: Double? = nil
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -252,6 +256,52 @@ public struct SearchResult: Codable, Sendable, Identifiable {
         self.videoFrameRate = videoFrameRate
         self.source = source
         self.highlightNode = highlightNode
+        self.semanticScore = semanticScore
+    }
+
+    /// True when keywords didn't find this frame and only its meaning did.
+    public var isSemanticOnly: Bool {
+        semanticScore != nil && highlightNode == nil && matchedText.isEmpty
+    }
+
+    /// A copy of this result carrying a semantic score and a new relevance score.
+    public func withSemanticScore(_ semanticScore: Double?, relevanceScore: Double) -> SearchResult {
+        SearchResult(
+            id: id,
+            timestamp: timestamp,
+            snippet: snippet,
+            matchedText: matchedText,
+            relevanceScore: relevanceScore,
+            metadata: metadata,
+            segmentID: segmentID,
+            videoID: videoID,
+            frameIndex: frameIndex,
+            videoPath: videoPath,
+            videoFrameRate: videoFrameRate,
+            source: source,
+            highlightNode: highlightNode,
+            semanticScore: semanticScore
+        )
+    }
+
+    /// A copy of this result marked as containing the query's words (so it is not `isSemanticOnly`).
+    public func withMatchedText(_ matchedText: String) -> SearchResult {
+        SearchResult(
+            id: id,
+            timestamp: timestamp,
+            snippet: snippet,
+            matchedText: matchedText,
+            relevanceScore: relevanceScore,
+            metadata: metadata,
+            segmentID: segmentID,
+            videoID: videoID,
+            frameIndex: frameIndex,
+            videoPath: videoPath,
+            videoFrameRate: videoFrameRate,
+            source: source,
+            highlightNode: highlightNode,
+            semanticScore: semanticScore
+        )
     }
 }
 

@@ -157,6 +157,14 @@ enum FeedbackRecentMetricSupport {
             return "Comment added"
         case .ocrReprocessRequests:
             return "OCR refresh requested"
+        case .semanticSearchResults:
+            return "Semantic matches added to search"
+        case .semanticSearchToggled:
+            return "Semantic search toggled"
+        case .semanticModelDownload:
+            return "Semantic model download"
+        case .semanticIndexRemoved:
+            return "Semantic index removed"
         case .captureIntervalUpdated:
             return "Capture interval updated"
         case .videoQualityUpdated:

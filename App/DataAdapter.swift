@@ -70,6 +70,9 @@ public actor DataAdapter {
     private var isInitialized = false
     private var cachedHiddenTagId: Int64?
 
+    /// Finds frames by meaning. Nil until semantic search is wired up (and in tests that don't need it).
+    private var semanticSearch: (any SemanticSearchProtocol)?
+
     // MARK: - Initialization
 
     public init(
@@ -84,6 +87,11 @@ public actor DataAdapter {
         self.retraceConfig = retraceConfig
         self.retraceImageExtractor = retraceImageExtractor
         self.database = database
+    }
+
+    /// Lets search add frames found by meaning to keyword results.
+    public func setSemanticSearch(_ semanticSearch: (any SemanticSearchProtocol)?) {
+        self.semanticSearch = semanticSearch
     }
 
     /// Configure Rewind data source (encrypted SQLCipher database)
@@ -1250,8 +1258,191 @@ public actor DataAdapter {
 
     // MARK: - Full-Text Search
 
-    /// Search across all data sources
+    /// Search across all data sources.
+    ///
+    /// Keyword search runs as before. On the first page, frames whose meaning matches the query are added when
+    /// semantic search is on: fused with the keyword matches in `.relevant` mode, and listed after them in
+    /// `.all` mode once Retrace's keyword matches have all been shown. Later pages are keyword-only.
+    ///
+    /// The semantic side runs alongside the keyword search and is given a deadline: keyword results are never
+    /// held back by more than `semanticDeadline` (longer only when there are none to show).
     public func search(query: SearchQuery) async throws -> SearchResults {
+        guard let semanticSearch, Self.couldAddSemanticMatches(for: query) else {
+            return try await keywordSearch(query: query)
+        }
+
+        // With filters on, most of the best matches may fall outside them: ask for many more, so enough that
+        // pass the filters are left.
+        let candidateLimit = query.filters.hasFilters
+            ? Self.semanticFilteredCandidateLimit
+            : Self.semanticCandidateLimit
+        // In `.relevant` mode the matches are always wanted, so they are fetched while the keyword search runs.
+        // In `.all` mode they are only wanted when the keyword matches turn out to fit this page.
+        var semanticTask = query.mode == .relevant
+            ? Task { await semanticSearch.matches(for: query.text, limit: candidateLimit) }
+            : nil
+
+        let keywordResults: SearchResults
+        do {
+            keywordResults = try await keywordSearch(query: query)
+        } catch {
+            semanticTask?.cancel()
+            throw error
+        }
+        guard Self.shouldAddSemanticMatches(to: keywordResults, for: query) else {
+            semanticTask?.cancel()
+            return keywordResults
+        }
+
+        let keywordReady = Date()
+        let deadline = keywordResults.results.isEmpty ? Self.semanticDeadlineWhenEmpty : Self.semanticDeadline
+        if semanticTask == nil {
+            semanticTask = Task { await semanticSearch.matches(for: query.text, limit: candidateLimit) }
+        }
+        guard let semanticTask, let matches = await Self.value(of: semanticTask, within: deadline) else {
+            Log.info(
+                "[DataAdapter] Semantic matches not ready within \(deadline), returning keyword results",
+                category: .app
+            )
+            return keywordResults
+        }
+        guard !matches.isEmpty else { return keywordResults }
+
+        let hiddenTagId = cachedHiddenTagId
+        let frameIDs = matches.map(\.frameID)
+        let semanticOnly: [SearchResult]
+        do {
+            semanticOnly = try await withNativeRead(operation: "data_adapter.search.semantic") { connection, config in
+                // The matches are looked up best first, a chunk at a time, until the page has its share of
+                // results or no match is left that could add one. Without filters the first chunk does; with
+                // a filter that most matches fall outside, this goes on down the list.
+                let isStrong = { (match: SemanticMatch) in match.cosine >= SemanticSearchSettings.strongMatchCosine }
+                let strongOfFrame = Dictionary(matches.map { ($0.frameID, isStrong($0)) }, uniquingKeysWith: { $0 || $1 })
+                let lastStrong = matches.lastIndex(where: isStrong) ?? -1
+                var rows: [Int64: SearchResult] = [:]
+                var candidates: [SearchResult] = []
+                var start = 0
+                while start < frameIDs.count {
+                    let end = min(start + Self.semanticRowChunkSize, frameIDs.count)
+                    let chunk = try Self.semanticSearchRows(
+                        frameIDs: Array(frameIDs[start..<end]),
+                        query: query,
+                        connection: connection,
+                        config: config,
+                        hiddenTagId: hiddenTagId
+                    )
+                    rows.merge(chunk) { first, _ in first }
+                    start = end
+                    candidates = Self.semanticOnlyResults(
+                        keywordResults: keywordResults.results,
+                        matches: Array(matches[..<end]),
+                        semanticRows: rows
+                    )
+                    if candidates.count >= Self.semanticResultLimit { break }
+                    // Only weak matches are left, and as many of those as are ever shown have been found.
+                    let weakShown = candidates.filter { strongOfFrame[$0.id.value] == false }.count
+                    if end > lastStrong, weakShown >= Self.semanticWeakResultLimit { break }
+                }
+                // A frame can contain every query word and still be missing from this page of keyword results
+                // (it ranked below the page). Such a frame was found by its words too: say so.
+                let containingQuery = try Self.framesMatchingKeywordQuery(
+                    among: candidates.map(\.id.value),
+                    query: query,
+                    connection: connection
+                )
+                return candidates.map { result in
+                    containingQuery.contains(result.id.value) ? result.withMatchedText(query.text) : result
+                }
+            }
+        } catch {
+            Log.warning("[DataAdapter] Semantic matches unavailable, returning keyword results: \(error)", category: .app)
+            return keywordResults
+        }
+
+        let merged = Self.mergeSemanticResults(
+            keywordResults: keywordResults.results,
+            matches: matches,
+            semanticOnly: semanticOnly,
+            mode: query.mode,
+            isLookup: Self.isLookupQuery(query.text)
+        )
+        let addedMs = Date().timeIntervalSince(keywordReady) * 1000
+        Log.recordLatency(
+            "search.semantic.added_ms",
+            valueMs: addedMs,
+            category: .app,
+            summaryEvery: 10,
+            warningThresholdMs: 250
+        )
+        return SearchResults(
+            query: query,
+            results: merged,
+            searchTimeMs: keywordResults.searchTimeMs + Int(addedMs),
+            nextCursor: keywordResults.nextCursor
+        )
+    }
+
+    /// The task's value, or nil if it isn't there within `timeout` (the task is then cancelled and left to
+    /// finish on its own). Also returns nil at once if the caller is cancelled.
+    private static func value<Value: Sendable>(
+        of task: Task<Value, Never>,
+        within timeout: Duration
+    ) async -> Value? {
+        let gate = FirstValueGate<Value>()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Value?, Never>) in
+                gate.wait(continuation)
+                let timer = Task {
+                    try? await Task.sleep(for: timeout)
+                    if gate.resume(nil) { task.cancel() }
+                }
+                Task {
+                    let value = await task.value
+                    gate.resume(value)
+                    timer.cancel()
+                }
+            }
+        } onCancel: {
+            if gate.resume(nil) { task.cancel() }
+        }
+    }
+
+    /// Resumes one continuation with whichever value arrives first.
+    private final class FirstValueGate<Value: Sendable>: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<Value?, Never>?
+        private var early: Value??
+
+        func wait(_ continuation: CheckedContinuation<Value?, Never>) {
+            lock.lock()
+            if let early {
+                lock.unlock()
+                continuation.resume(returning: early)
+                return
+            }
+            self.continuation = continuation
+            lock.unlock()
+        }
+
+        /// Returns whether this call was the one that delivered.
+        @discardableResult
+        func resume(_ value: Value?) -> Bool {
+            lock.lock()
+            guard early == nil else {
+                lock.unlock()
+                return false
+            }
+            early = .some(value)
+            let waiting = continuation
+            continuation = nil
+            lock.unlock()
+            waiting?.resume(returning: value)
+            return true
+        }
+    }
+
+    /// Keyword (FTS) search across all data sources.
+    private func keywordSearch(query: SearchQuery) async throws -> SearchResults {
         guard isInitialized else {
             throw DataAdapterError.notInitialized
         }
@@ -3604,6 +3795,453 @@ public actor DataAdapter {
             searchTimeMs: totalElapsed,
             nextCursor: nextCursor
         )
+    }
+
+    // MARK: - Semantic Matches
+
+    /// Frames asked of semantic search per query (before filters and de-duplication).
+    static let semanticCandidateLimit = 200
+    /// Frames asked for when the query has filters (app, date, tag, …). The filters are applied afterwards, going
+    /// down the matches best first until the page has its share, so this is how deep a match inside the filter
+    /// may sit below better ones outside it. About 2% of frames stand out for a query: this covers all of
+    /// them up to a million frames.
+    static let semanticFilteredCandidateLimit = 20_000
+    /// Frame ids looked up per SQL statement (well under SQLite's bound-parameter limit).
+    static let semanticRowChunkSize = 400
+    /// Most semantic-only results added to a page.
+    static let semanticResultLimit = 30
+    /// Most of those that may be weak matches (below `SemanticSearchSettings.strongMatchCosine`): enough to
+    /// show the best there is, few enough that a query about nothing in the history isn't answered with a page
+    /// of loosely related frames.
+    static let semanticWeakResultLimit = 3
+    /// Two semantic matches in the same app window this close together are the same moment.
+    static let semanticSameWindowInterval: TimeInterval = 300
+    /// How long keyword results wait for the semantic side once they are ready. Warm, it needs about 30 ms; this
+    /// only cuts in when the model is still starting or the vectors are still being read.
+    static let semanticDeadline: Duration = .milliseconds(400)
+    /// The same, when keyword search found nothing and there is nothing else to show.
+    static let semanticDeadlineWhenEmpty: Duration = .seconds(3)
+    /// The constant of reciprocal rank fusion (the usual 60).
+    static let semanticFusionConstant = 60.0
+
+    /// Whether this query could get semantic matches at all (decided before any searching, so the semantic
+    /// side can start alongside the keyword search). Only the first page does: keyword paging walks a BM25 or
+    /// date cursor that meaning has no place in.
+    static func couldAddSemanticMatches(for query: SearchQuery) -> Bool {
+        query.cursor == nil && query.offset == 0
+            && !query.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Whether semantic matches join this page of keyword results.
+    ///
+    /// In `.all` mode (every keyword match, by date) they follow the keyword matches, and only once those have
+    /// all been shown, so the chronological list is never interrupted. With Rewind history connected the list
+    /// continues into Rewind's matches, which are older than anything Retrace recorded; newest first, the
+    /// semantic matches (always Retrace frames) then sit between the two.
+    static func shouldAddSemanticMatches(to keywordResults: SearchResults, for query: SearchQuery) -> Bool {
+        guard couldAddSemanticMatches(for: query) else { return false }
+        switch query.mode {
+        case .relevant:
+            return true
+        case .all:
+            guard let next = keywordResults.nextCursor else { return true }
+            return query.sortOrder == .newestFirst
+                && next.native == nil
+                && keywordResults.results.allSatisfy { $0.source == .native }
+        }
+    }
+
+    /// A short query, or one with a quoted phrase, is someone looking a name up: the frames that contain it
+    /// come first.
+    static func isLookupQuery(_ text: String) -> Bool {
+        let tokens = queryTokenizer.tokenize(text).filter { $0.kind == .term || $0.kind == .phrase }
+        return tokens.count <= 2 || tokens.contains { $0.kind == .phrase }
+    }
+
+    /// The matched frames that keyword search did not return, as results, best first.
+    ///
+    /// - `semanticRows`: the matched frames that passed the query's filters, by frame id.
+    /// - Thinned to one per app segment, skipping segments keyword search already returned and frames of the
+    ///   same window within a few minutes of a better match: consecutive frames mean nearly the same thing and
+    ///   would otherwise fill the page with one moment.
+    /// - At most `semanticWeakResultLimit` of them are weak matches.
+    static func semanticOnlyResults(
+        keywordResults: [SearchResult],
+        matches: [SemanticMatch],
+        semanticRows: [Int64: SearchResult],
+        limit: Int = semanticResultLimit
+    ) -> [SearchResult] {
+        // Rewind frames have ids of their own; only native results can be the same frame as a match.
+        let nativeKeywordResults = keywordResults.filter { $0.source == .native }
+        let keywordFrameIDs = Set(nativeKeywordResults.map(\.id.value))
+        let keywordSegments = Set(nativeKeywordResults.map(\.segmentID.value))
+
+        var semanticOnly: [SearchResult] = []
+        var acceptedSegments = Set<Int64>()
+        var weakAccepted = 0
+        for match in matches {
+            guard semanticOnly.count < limit else { break }
+            let isWeak = match.cosine < SemanticSearchSettings.strongMatchCosine
+            if isWeak, weakAccepted >= semanticWeakResultLimit { continue }
+            guard !keywordFrameIDs.contains(match.frameID), let row = semanticRows[match.frameID] else { continue }
+            let segment = row.segmentID.value
+            guard !keywordSegments.contains(segment), !acceptedSegments.contains(segment) else { continue }
+            let isSameMoment = semanticOnly.contains { accepted in
+                accepted.metadata.appBundleID == row.metadata.appBundleID
+                    && accepted.metadata.windowName == row.metadata.windowName
+                    && abs(accepted.timestamp.timeIntervalSince(row.timestamp)) < semanticSameWindowInterval
+            }
+            guard !isSameMoment else { continue }
+            acceptedSegments.insert(segment)
+            if isWeak { weakAccepted += 1 }
+            semanticOnly.append(
+row.withSemanticScore(match.score, relevanceScore: max(match.score, 0) / (1 + max(match.score, 0)))
+            )
+        }
+        return semanticOnly
+    }
+
+    /// Combines a page of keyword results with the semantic-only results for the same query.
+    ///
+    /// - `.all`: the keyword results in their own (date) order, followed by the semantic results, best first.
+    /// - `.relevant`: reciprocal rank fusion of two orders, the keyword (BM25) order and the meaning order. A
+    ///   frame in both (it contains the words and its meaning stands out) rises above frames in one; the rest
+    ///   interleave, keyword first, so neither kind can push the other off the first screen. For a lookup
+    ///   (`isLookup`) every result of this keyword page comes before the meaning-only ones, however long the
+    ///   page; among the keyword results, meaning counts half.
+    static func mergeSemanticResults(
+        keywordResults: [SearchResult],
+        matches: [SemanticMatch],
+        semanticOnly: [SearchResult],
+        mode: SearchMode,
+        isLookup: Bool = false
+    ) -> [SearchResult] {
+        guard mode == .relevant else {
+            return keywordResults + semanticOnly
+        }
+
+        let scoreByFrame = Dictionary(matches.map { ($0.frameID, $0.score) }, uniquingKeysWith: max)
+        var entries: [(result: SearchResult, keywordRank: Int?, semanticScore: Double?, order: Int)] = []
+        entries.reserveCapacity(keywordResults.count + semanticOnly.count)
+        for (order, result) in keywordResults.enumerated() {
+            let score = result.source == .native ? scoreByFrame[result.id.value] : nil
+            let annotated = score.map { result.withSemanticScore($0, relevanceScore: result.relevanceScore) } ?? result
+            entries.append((annotated, order + 1, score, order))
+        }
+        for (order, result) in semanticOnly.enumerated() {
+            entries.append((result, nil, result.semanticScore, keywordResults.count + order))
+        }
+
+        // Rank in the meaning order, among the frames on this page that have a place in it.
+        var semanticRank: [Int: Int] = [:]
+        let byMeaning = entries.indices
+            .filter { entries[$0].semanticScore != nil }
+            .sorted {
+                let (a, b) = (entries[$0], entries[$1])
+                return a.semanticScore! > b.semanticScore! || (a.semanticScore! == b.semanticScore! && a.order < b.order)
+            }
+        for (rank, index) in byMeaning.enumerated() { semanticRank[index] = rank + 1 }
+
+        let semanticWeight = isLookup ? 0.5 : 1.0
+        func fused(_ index: Int) -> Double {
+            let keyword = entries[index].keywordRank.map { 1 / (semanticFusionConstant + Double($0)) } ?? 0
+            let semantic = semanticRank[index].map { semanticWeight / (semanticFusionConstant + Double($0)) } ?? 0
+            return keyword + semantic
+        }
+        return entries.indices
+            .map { (index: $0, score: fused($0), afterKeywords: isLookup && entries[$0].keywordRank == nil) }
+            .sorted { a, b in
+                if a.afterKeywords != b.afterKeywords { return !a.afterKeywords }
+                return a.score > b.score || (a.score == b.score && entries[a.index].order < entries[b.index].order)
+            }
+            .map { entries[$0.index].result }
+    }
+
+    /// The frames among `frameIDs` whose text contains the query's words, as keyword search requires them.
+    ///
+    /// The frames' text is read and checked here rather than by running the FTS match again: these are a few
+    /// dozen frames at most, and an FTS match per frame costs hundreds of milliseconds for a long query. The
+    /// check follows the keyword query's rules (see `parseFTSQueryComponents`): every term or phrase present in
+    /// the main text, or every one present in the other text; terms match as word prefixes unless they are
+    /// short or stopwords; words are compared without case or diacritics.
+    private static func framesMatchingKeywordQuery(
+        among frameIDs: [Int64],
+        query: SearchQuery,
+        connection: DatabaseConnection
+    ) throws -> Set<Int64> {
+        guard !frameIDs.isEmpty else { return [] }
+        let required: [(words: [String], prefix: Bool)] = queryTokenizer.tokenize(query.text).compactMap { token in
+            let sanitized = token.sanitizedText
+            guard !sanitized.isEmpty else { return nil }
+            switch token.kind {
+            case .phrase:
+                return (keywordWords(in: sanitized), false)
+            case .term:
+                return (keywordWords(in: sanitized), !shouldUseExactMatch(sanitized))
+            case .excludedTerm, .excludedPhrase, .ignoredShellOption:
+                return nil
+            }
+        }.filter { !$0.words.isEmpty }
+        guard !required.isEmpty else { return [] }
+
+        let placeholders = frameIDs.map { _ in "?" }.joined(separator: ", ")
+        let sql = """
+            SELECT ds.frameId, sc.c0, sc.c1
+            FROM doc_segment ds
+            JOIN searchRanking_content sc ON sc.id = ds.docid
+            WHERE ds.frameId IN (\(placeholders))
+            AND ds.docid = (SELECT MAX(latest.docid) FROM doc_segment latest WHERE latest.frameId = ds.frameId)
+            """
+        guard let statement = try connection.prepare(sql: sql) else { return [] }
+        defer { connection.finalize(statement) }
+        for (offset, frameID) in frameIDs.enumerated() {
+            sqlite3_bind_int64(statement, Int32(offset + 1), frameID)
+        }
+
+        var found = Set<Int64>()
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let columns = [1, 2].map { column in
+                keywordWords(in: sqlite3_column_text(statement, Int32(column)).map { String(cString: $0) } ?? "")
+            }
+            let matches = columns.contains { words in
+                !words.isEmpty && required.allSatisfy { contains(words, $0.words, lastIsPrefix: $0.prefix) }
+            }
+            if matches { found.insert(sqlite3_column_int64(statement, 0)) }
+        }
+        return found
+    }
+
+    /// Text as the FTS tokenizer (unicode61) splits it: runs of letters and digits, without case or diacritics.
+    private static func keywordWords(in text: String) -> [String] {
+        text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+            .split { !$0.isLetter && !$0.isNumber }
+            .map(String.init)
+    }
+
+    /// Whether `sequence` appears in `words` as consecutive words, the last one matching as a prefix if asked.
+    private static func contains(_ words: [String], _ sequence: [String], lastIsPrefix: Bool) -> Bool {
+        guard let last = sequence.last, words.count >= sequence.count else { return false }
+        let head = sequence.dropLast()
+        for start in 0...(words.count - sequence.count) {
+            let candidate = words[start + sequence.count - 1]
+            guard lastIsPrefix ? candidate.hasPrefix(last) : candidate == last else { continue }
+            if zip(head, words[start...]).allSatisfy({ $0 == $1 }) { return true }
+        }
+        return false
+    }
+
+    /// Reads the frames semantic search matched, as results with no keyword match, keeping only those that pass
+    /// the query's filters (dates, apps, window and URL terms, tags, hidden segments, comments, excluded words).
+    private static func semanticSearchRows(
+        frameIDs: [Int64],
+        query: SearchQuery,
+        connection: DatabaseConnection,
+        config: DatabaseConfig,
+        hiddenTagId: Int64?
+    ) throws -> [Int64: SearchResult] {
+        guard !frameIDs.isEmpty else { return [:] }
+        let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+        var whereConditions: [String] = []
+        var bindValues: [Any] = []
+
+        let idPlaceholders = frameIDs.map { _ in "?" }.joined(separator: ", ")
+        whereConditions.append("f.id IN (\(idPlaceholders))")
+        bindValues.append(contentsOf: frameIDs)
+
+        let dateRangeFilter = buildDateRangeUnionClause(
+            ranges: query.filters.effectiveDateRanges,
+            columnName: "f.createdAt"
+        )
+        if let dateRangeClause = dateRangeFilter.clause {
+            whereConditions.append(dateRangeClause)
+            bindValues.append(contentsOf: dateRangeFilter.bindValues.map(config.formatDate))
+        }
+        let sourceBoundaryFilter = buildSourceBoundaryClause(config: config, columnName: "f.createdAt")
+        if let sourceBoundaryClause = sourceBoundaryFilter.clause {
+            whereConditions.append(sourceBoundaryClause)
+            bindValues.append(contentsOf: sourceBoundaryFilter.bindValues.map(config.formatDate))
+        }
+        if let visibilityClause = Self.nativeVisibleFrameClause(frameAlias: "f", isRewindDatabase: false) {
+            whereConditions.append(visibilityClause)
+        }
+
+        if let appBundleIDs = query.filters.appBundleIDs, !appBundleIDs.isEmpty {
+            let appPlaceholders = appBundleIDs.map { _ in "?" }.joined(separator: ", ")
+            whereConditions.append("s.bundleID IN (\(appPlaceholders))")
+            bindValues.append(contentsOf: appBundleIDs)
+        }
+        if let excludedAppBundleIDs = query.filters.excludedAppBundleIDs, !excludedAppBundleIDs.isEmpty {
+            let appPlaceholders = excludedAppBundleIDs.map { _ in "?" }.joined(separator: ", ")
+            whereConditions.append("s.bundleID NOT IN (\(appPlaceholders))")
+            bindValues.append(contentsOf: excludedAppBundleIDs)
+        }
+
+        Self.appendMetadataStringFilter(
+            columnName: "s.windowName",
+            parsedFilter: decodeMetadataStringFilter(query.filters.windowNameFilter),
+            whereConditions: &whereConditions,
+            bindValues: &bindValues
+        )
+        Self.appendMetadataStringFilter(
+            columnName: "s.browserUrl",
+            parsedFilter: decodeMetadataStringFilter(query.filters.browserUrlFilter),
+            whereConditions: &whereConditions,
+            bindValues: &bindValues
+        )
+
+        var tagJoinBindValues: [Int64] = []
+        let tagJoin: String
+        if let tagIds = query.filters.selectedTagIds, !tagIds.isEmpty {
+            let tagPlaceholders = tagIds.map { _ in "?" }.joined(separator: ", ")
+            tagJoin = "INNER JOIN segment_tag st_include ON f.segmentId = st_include.segmentId AND st_include.tagId IN (\(tagPlaceholders))"
+            tagJoinBindValues = tagIds
+        } else {
+            tagJoin = ""
+        }
+
+        if let excludedTagIds = query.filters.excludedTagIds, !excludedTagIds.isEmpty {
+            let tagPlaceholders = excludedTagIds.map { _ in "?" }.joined(separator: ", ")
+            whereConditions.append("""
+                NOT EXISTS (
+                    SELECT 1 FROM segment_tag st_exclude
+                    WHERE st_exclude.segmentId = f.segmentId
+                    AND st_exclude.tagId IN (\(tagPlaceholders))
+                )
+                """)
+            bindValues.append(contentsOf: excludedTagIds)
+        }
+
+        switch query.filters.hiddenFilter {
+        case .hide:
+            if let hiddenTagId {
+                whereConditions.append("""
+                    NOT EXISTS (
+                        SELECT 1 FROM segment_tag st_hidden
+                        WHERE st_hidden.segmentId = f.segmentId
+                        AND st_hidden.tagId = ?
+                    )
+                    """)
+                bindValues.append(hiddenTagId)
+            }
+        case .onlyHidden:
+            if let hiddenTagId {
+                whereConditions.append("""
+                    EXISTS (
+                        SELECT 1 FROM segment_tag st_hidden
+                        WHERE st_hidden.segmentId = f.segmentId
+                        AND st_hidden.tagId = ?
+                    )
+                    """)
+                bindValues.append(hiddenTagId)
+            }
+        case .showAll:
+            break
+        }
+
+        if let commentClause = Self.buildCommentFilterClause(
+            query.filters.commentFilter,
+            isRewindDatabase: false,
+            segmentIDExpression: "f.segmentId"
+        ) {
+            whereConditions.append(commentClause)
+        }
+
+        // `-word` in the search box: keyword search drops frames containing it, so meaning must too. The same
+        // FTS match decides, so "contains" means the same thing in both (whole tokens, unicode61 folding).
+        // The match is asked of each candidate's own document (by rowid), not of the whole index: an excluded
+        // word can be in a large share of the history, and only these frames matter here. Excluded terms are
+        // exact words or phrases, so each check is one small lookup.
+        let excludeTerms = parseFTSQueryComponents(query.text).excludeTerms
+        if !excludeTerms.isEmpty {
+            let exclusionQuery = excludeTerms
+                .map { "(text:(\($0)) OR otherText:(\($0)))" }
+                .joined(separator: " OR ")
+            whereConditions.append("""
+                NOT EXISTS (
+                    SELECT 1 FROM searchRanking
+                    WHERE searchRanking MATCH ?
+                    AND searchRanking.rowid = (
+                        SELECT MAX(ds_excluded.docid) FROM doc_segment ds_excluded WHERE ds_excluded.frameId = f.id
+                    )
+                )
+                """)
+            bindValues.append(exclusionQuery)
+        }
+
+        let sql = """
+            SELECT
+                f.id,
+                f.createdAt,
+                f.segmentId,
+                f.videoId,
+                f.videoFrameIndex,
+                v.path,
+                v.frameRate,
+                f.redactionReason,
+                f.capture_trigger,
+                s.bundleID,
+                s.windowName,
+                s.browserUrl
+            FROM frame f
+            JOIN segment s ON f.segmentId = s.id
+            LEFT JOIN video v ON v.id = f.videoId
+            \(tagJoin)
+            WHERE \(whereConditions.joined(separator: " AND "))
+            """
+
+        guard let statement = try connection.prepare(sql: sql) else {
+            return [:]
+        }
+        defer { connection.finalize(statement) }
+
+        var bindIndex: Int32 = 1
+        for tagId in tagJoinBindValues {
+            sqlite3_bind_int64(statement, bindIndex, tagId)
+            bindIndex += 1
+        }
+        for value in bindValues {
+            if let stringValue = value as? String {
+                sqlite3_bind_text(statement, bindIndex, stringValue, -1, SQLITE_TRANSIENT)
+            } else if let intValue = value as? Int64 {
+                sqlite3_bind_int64(statement, bindIndex, intValue)
+            }
+            bindIndex += 1
+        }
+
+        var rows: [Int64: SearchResult] = [:]
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let frameId = sqlite3_column_int64(statement, 0)
+            let appBundleID = sqlite3_column_text(statement, 9).map { String(cString: $0) }
+            let videoFrameRate: Double? = sqlite3_column_type(statement, 6) != SQLITE_NULL
+                ? sqlite3_column_double(statement, 6)
+                : nil
+            rows[frameId] = SearchResult(
+                id: FrameID(value: frameId),
+                timestamp: config.parseDate(from: statement, column: 1) ?? Date(),
+                snippet: "",
+                matchedText: "",
+                relevanceScore: 0,
+                metadata: FrameMetadata(
+                    appBundleID: appBundleID,
+                    appName: appBundleID?.components(separatedBy: ".").last,
+                    windowName: sqlite3_column_text(statement, 10).map { String(cString: $0) },
+                    browserURL: sqlite3_column_text(statement, 11).map { String(cString: $0) },
+                    redactionReason: sqlite3_column_text(statement, 7).map { String(cString: $0) },
+                    captureTrigger: sqlite3_column_text(statement, 8)
+                        .map { String(cString: $0) }
+                        .flatMap(FrameCaptureTrigger.init(rawValue:)),
+                    displayID: 0
+                ),
+                segmentID: AppSegmentID(value: sqlite3_column_int64(statement, 2)),
+                videoID: VideoSegmentID(value: sqlite3_column_int64(statement, 3)),
+                frameIndex: Int(sqlite3_column_int(statement, 4)),
+                videoPath: sqlite3_column_text(statement, 5).map { String(cString: $0) },
+                videoFrameRate: videoFrameRate,
+                source: .native
+            )
+        }
+        return rows
     }
 
     private static func searchAll(
