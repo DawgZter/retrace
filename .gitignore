@@ -119,3 +119,6 @@ scripts/release.sh
 # Release artifacts
 releases/
 local/
+
+# llama.cpp built for the semantic search helper (scripts/build_llama_embedding.sh)
+Vendors/llamacpp/

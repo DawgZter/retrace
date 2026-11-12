@@ -1,0 +1,12 @@
+// llama.cpp for RetraceEmbeddingHelper, built by scripts/build_llama_embedding.sh into Vendors/llamacpp.
+module CLlamaEmbedding [system] {
+    header "../../Vendors/llamacpp/include/llama.h"
+    header "../../Vendors/llamacpp/include/mtmd.h"
+    link "llamacpp"
+    link "c++"
+    link framework "Accelerate"
+    link framework "Foundation"
+    link framework "Metal"
+    link framework "MetalKit"
+    export *
+}

@@ -1,4 +1,5 @@
 // swift-tools-version:5.9
+import Foundation
 import PackageDescription
 
 // MARK: - Whisper.cpp Path Configuration (Bundled)
@@ -209,6 +210,8 @@ let package = Package(
             dependencies: [
                 "App",
                 "Database",
+                "Search",
+                "Storage",
                 "Shared"
             ],
             path: "App/Tests"
@@ -290,3 +293,26 @@ let package = Package(
         ),
     ]
 )
+
+// MARK: - Semantic search embedding helper (optional)
+// RetraceEmbeddingHelper runs the embedding model on llama.cpp in its own process. It needs the static library
+// that scripts/build_llama_embedding.sh builds into Vendors/llamacpp. Without that library the package builds as
+// before and the app simply reports semantic search as unavailable.
+if FileManager.default.fileExists(atPath: "\(Context.packageDirectory)/Vendors/llamacpp/lib/libllamacpp.a") {
+    package.products.append(
+        .executable(name: "RetraceEmbeddingHelper", targets: ["RetraceEmbeddingHelper"])
+    )
+    package.targets.append(
+        .systemLibrary(name: "CLlamaEmbedding", path: "Sources/CLlamaEmbedding")
+    )
+    package.targets.append(
+        .executableTarget(
+            name: "RetraceEmbeddingHelper",
+            dependencies: ["CLlamaEmbedding"],
+            path: "Sources/RetraceEmbeddingHelper",
+            linkerSettings: [
+                .unsafeFlags(["-L\(Context.packageDirectory)/Vendors/llamacpp/lib"])
+            ]
+        )
+    )
+}
