@@ -2759,8 +2759,18 @@ public class SimpleTimelineViewModel: ObservableObject {
     private func setupSearchOverlayPersistence() {
         $isSearchOverlayVisible
             .dropFirst() // Skip initial value from restoration
-            .sink { isVisible in
+            .sink { [weak self] isVisible in
                 UserDefaults.standard.set(isVisible, forKey: "searchOverlayVisible")
+                // However the overlay comes back (Cmd+K, Escape out of a result, the timeline being shown
+                // again), its results are still there; if hiding it cut their check short, finish it. And
+                // however it goes away (another dialog taking its place included), the check stops with it.
+                // (The timeline itself has to be on screen too: at launch this flag is only a saved preference.
+                // `TimelineWindowController` resumes the check when the timeline is shown.)
+                if isVisible {
+                    if TimelineWindowController.shared.isVisible { self?.searchViewModel.resumeResultCheckIfNeeded() }
+                } else {
+                    self?.searchViewModel.pauseResultCheck()
+                }
             }
             .store(in: &cancellables)
     }

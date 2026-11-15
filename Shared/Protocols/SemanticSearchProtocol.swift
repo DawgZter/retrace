@@ -306,3 +306,147 @@ public struct SemanticIndexStatus: Sendable, Equatable {
         self.detail = detail
     }
 }
+
+// MARK: - Result check (prototype)
+
+/// Settings for the result check: a small local decision model looks at the best semantic results and says how
+/// sure it is that each one shows what was searched for. Results it is not sure enough about are left out, and
+/// the rest are ordered by how sure it is.
+///
+/// Prototype. There is no Settings UI and nothing is downloaded: the check runs only when the defaults below
+/// name a `llama-server` binary, a decision model and its image encoder that exist on disk.
+public enum SemanticCheckSettings {
+    /// UserDefaults keys (suite `io.retrace.app`).
+    public static let enabledDefaultsKey = "semanticCheckEnabled"
+    public static let serverPathDefaultsKey = "semanticCheckServerPath"
+    public static let modelPathDefaultsKey = "semanticCheckModelPath"
+    public static let projectorPathDefaultsKey = "semanticCheckProjectorPath"
+    public static let cutoffDefaultsKey = "semanticCheckCutoff"
+
+    /// Results looked at per search, best first: every semantic-only result search returns (it returns at most
+    /// 30). Measured with vllm-d3 lite on one history: against stopping at 20, the right result of a
+    /// single-answer search was found for 60 of 70 searches instead of 57 and came first for 48 instead of 44;
+    /// looking at 40 or 50 added next to nothing on the first page. A check takes about 0.4 s on an M5 Pro with
+    /// the frame read, so thirty take about 12 s.
+    public static let depth = 30
+    /// Confidence a result needs to stay. Measured with vllm-d3 lite: at 0.4, first-ten precision went from
+    /// 71% to 88% on held-out searches with 93% of right results kept, and all ten searches about things that
+    /// never happened came back empty.
+    public static let defaultCutoff = 0.4
+    /// Tokens a screenshot may take. Half of this is 2.3 times as fast and a little less accurate.
+    public static let imageTokens = 1024
+    /// Longest side of the screenshot sent to the model, in pixels.
+    public static let imageWidth = 1536
+    /// What the model is asked. The wording matters a great deal: longer, more careful questions did much
+    /// worse on all five models tried.
+    public static func question(for query: String) -> String {
+        "Does this screenshot show: \(query)?"
+    }
+
+    private static var defaults: UserDefaults {
+        UserDefaults(suiteName: "io.retrace.app") ?? .standard
+    }
+
+    public static var serverPath: String? { defaults.string(forKey: serverPathDefaultsKey) }
+    public static var modelPath: String? { defaults.string(forKey: modelPathDefaultsKey) }
+    public static var projectorPath: String? { defaults.string(forKey: projectorPathDefaultsKey) }
+
+    /// On only with semantic search itself, the switch, and all three files in place.
+    public static var isEnabled: Bool {
+        guard SemanticSearchSettings.isEnabled, defaults.bool(forKey: enabledDefaultsKey) else { return false }
+        return [serverPath, modelPath, projectorPath].allSatisfy { path in
+            path.map { FileManager.default.fileExists(atPath: $0) } ?? false
+        }
+    }
+
+    public static var cutoff: Double {
+        let stored = defaults.double(forKey: cutoffDefaultsKey)
+        return stored > 0 && stored < 1 ? stored : defaultCutoff
+    }
+}
+
+/// One semantic result, as the check needs it: where its screenshot is and what window it was.
+public struct SemanticCheckCandidate: Sendable, Equatable {
+    public let frameID: Int64
+    public let appName: String?
+    public let windowName: String?
+    public let videoPath: String?
+    public let frameIndex: Int
+    public let videoFrameRate: Double?
+
+    public init(
+        frameID: Int64,
+        appName: String?,
+        windowName: String?,
+        videoPath: String?,
+        frameIndex: Int,
+        videoFrameRate: Double?
+    ) {
+        self.frameID = frameID
+        self.appName = appName
+        self.windowName = windowName
+        self.videoPath = videoPath
+        self.frameIndex = frameIndex
+        self.videoFrameRate = videoFrameRate
+    }
+}
+
+/// Looks at semantic results and says how sure it is that each shows what was searched for.
+public protocol SemanticResultChecking: Sendable {
+    /// Confidence from 0 to 1 per frame id, for as many of `candidates` as could be checked before `deadline`
+    /// ran out, taken in order. Empty when the check could not run at all. Never throws: search must keep working.
+    func confidences(
+        for query: String,
+        candidates: [SemanticCheckCandidate],
+        deadline: Duration
+    ) async -> [Int64: Double]
+
+    /// The same answers one at a time, each as soon as it is known, in the order of `candidates`. The stream
+    /// ends when every candidate was looked at or `deadline` ran out; ending it early stops the check.
+    func verdicts(
+        for query: String,
+        candidates: [SemanticCheckCandidate],
+        deadline: Duration
+    ) -> AsyncStream<SemanticCheckVerdict>
+}
+
+extension SemanticResultChecking {
+    /// For a checker that only answers all at once: every answer arrives together, when it is done.
+    public func verdicts(
+        for query: String,
+        candidates: [SemanticCheckCandidate],
+        deadline: Duration
+    ) -> AsyncStream<SemanticCheckVerdict> {
+        AsyncStream { continuation in
+            let work = Task {
+                let answers = await confidences(for: query, candidates: candidates, deadline: deadline)
+                for candidate in candidates {
+                    if let confidence = answers[candidate.frameID] {
+                        continuation.yield(SemanticCheckVerdict(frameID: candidate.frameID, confidence: confidence))
+                    }
+                }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in work.cancel() }
+        }
+    }
+}
+
+/// How sure the check model is that one result shows what was searched for.
+public struct SemanticCheckVerdict: Sendable, Equatable {
+    public let frameID: Int64
+    public let confidence: Double
+
+    public init(frameID: Int64, confidence: Double) {
+        self.frameID = frameID
+        self.confidence = confidence
+    }
+}
+
+/// What the result check reports about one page of results while it works through it.
+public enum SemanticCheckEvent: Sendable, Equatable {
+    /// The check has begun and will look at this many results.
+    case started(asked: Int)
+    /// One result was looked at. `isKept` is false when the model was not sure enough: the result should go.
+    case decided(frameID: Int64, confidence: Double, isKept: Bool)
+}

@@ -38,6 +38,8 @@ public actor ServiceContainer {
     /// Search by meaning. Created during `initialize()`; does nothing until enabled in Settings.
     public private(set) var semanticSearch: SemanticSearchService?
     public private(set) var semanticIndexer: SemanticIndexer?
+    /// The result check (prototype); nil unless `SemanticCheckSettings` names its files.
+    public private(set) var semanticChecker: SemanticCheckService?
 
     // MARK: - Configuration
 
@@ -404,6 +406,20 @@ public actor ServiceContainer {
         self.semanticSearch = semanticService
         self.semanticIndexer = indexer
         await adapter.setSemanticSearch(semanticService)
+        // The result check (prototype): only when the defaults name a server binary and model files.
+        if let server = SemanticCheckSettings.serverPath,
+           let model = SemanticCheckSettings.modelPath,
+           let projector = SemanticCheckSettings.projectorPath {
+            let checker = SemanticCheckService.readingRetraceStorage(
+                storageRoot: AppPaths.expandedStorageRoot,
+                database: database,
+                serverURL: URL(fileURLWithPath: server),
+                modelPath: model,
+                projectorPath: projector
+            )
+            self.semanticChecker = checker
+            await adapter.setSemanticChecker(checker)
+        }
         await indexer.start()
         Log.info("✓ Semantic search ready (helper: \(helperURL == nil ? "missing" : "found"))", category: .app)
 
@@ -716,6 +732,9 @@ public actor ServiceContainer {
         //     Log.info("✓ Audio capture stopped", category: .app)
         // }
 
+        // Stop the result check's model server, if it is running
+        await semanticChecker?.stop()
+
         // Stop processing queue workers
         await processingQueue?.stopWorkers()
         Log.info("✓ Processing queue workers stopped", category: .app)
@@ -819,6 +838,41 @@ public actor ServiceContainer {
 }
 
 // MARK: - Semantic Search Support
+
+extension SemanticCheckService {
+    /// The result check as the app runs it: screenshots come from Retrace's video storage, and only while the
+    /// database says their pixels are final.
+    static func readingRetraceStorage(
+        storageRoot: String,
+        database: DatabaseManager,
+        serverURL: URL,
+        modelPath: String,
+        projectorPath: String
+    ) -> SemanticCheckService {
+        SemanticCheckService(
+            serverURL: serverURL,
+            modelPath: modelPath,
+            projectorPath: projectorPath,
+            image: { candidate in
+                guard let videoPath = candidate.videoPath else { throw StorageFrameImageProvider.MissingVideo() }
+                // An extractor of its own for every read: nothing is shared with a check for another search
+                // that overlaps this one, so the frame always comes through a decoder opened on the file as
+                // it is now, and no decoder is left open afterwards.
+                let extractor = HEVCStorageExtractor(storageRoot: storageRoot)
+                defer { extractor.purgeFrameExtractionCaches(reason: "semantic result check") }
+                return try await extractor.extractFrameCGImage(
+                    videoPath: videoPath,
+                    frameIndex: candidate.frameIndex,
+                    frameRate: candidate.videoFrameRate
+                )
+            },
+            revision: { frameID in
+                // Unknown counts as not final: the frame is then not looked at.
+                (try? await database.finalImageRevision(ofFrame: frameID)) ?? nil
+            }
+        )
+    }
+}
 
 /// Reads a frame's screenshot from Retrace's video storage, for the image encoder.
 struct StorageFrameImageProvider: FrameImageProviding {

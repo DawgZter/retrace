@@ -159,6 +159,8 @@ enum FeedbackRecentMetricSupport {
             return "OCR refresh requested"
         case .semanticSearchResults:
             return "Semantic matches added to search"
+        case .semanticSearchCheck:
+            return "Semantic results checked"
         case .semanticSearchToggled:
             return "Semantic search toggled"
         case .semanticModelDownload:

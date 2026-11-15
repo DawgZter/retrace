@@ -3553,13 +3553,51 @@ public actor AppCoordinator {
         guard results.query.cursor == nil, results.query.offset == 0,
               ServiceContainer.isSemanticSearchUsable else { return }
         let semanticOnly = results.results.filter(\.isSemanticOnly).count
-        let metadata = Self.metricMetadata([
+        let fields: [String: Any] = [
             "mode": results.query.mode.rawValue,
             "keywordResults": results.results.count - semanticOnly,
             "semanticOnlyResults": semanticOnly
-        ])
+        ]
+        let metadata = Self.metricMetadata(fields)
         Task {
             try? await self.recordMetricEvent(metricType: .semanticSearchResults, metadata: metadata)
+        }
+    }
+
+    /// The result check (prototype) for a page of results already on screen: what it decides about each result
+    /// found by meaning alone, as each answer comes in. Empty when there is nothing to check. When it ends, how
+    /// many results it was asked about, answered for and left out is recorded as a daily metric.
+    public nonisolated func semanticCheckEvents(for results: SearchResults) -> AsyncStream<SemanticCheckEvent> {
+        AsyncStream { continuation in
+            let work = Task {
+                guard let adapter = await self.services.dataAdapter else {
+                    continuation.finish()
+                    return
+                }
+                var asked = 0, answered = 0, rejected = 0
+                let started = Date()
+                for await event in adapter.semanticCheckEvents(for: results) {
+                    switch event {
+                    case .started(let count):
+                        asked = count
+                    case .decided(_, _, let isKept):
+                        answered += 1
+                        if !isKept { rejected += 1 }
+                    }
+                    continuation.yield(event)
+                }
+                if asked > 0 {
+                    let metadata = Self.metricMetadata([
+                        "asked": asked,
+                        "answered": answered,
+                        "rejected": rejected,
+                        "ms": Int(Date().timeIntervalSince(started) * 1000)
+                    ])
+                    try? await self.recordMetricEvent(metricType: .semanticSearchCheck, metadata: metadata)
+                }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in work.cancel() }
         }
     }
 

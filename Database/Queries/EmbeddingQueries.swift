@@ -180,6 +180,47 @@ enum EmbeddingQueries {
         return .pending
     }
 
+    /// Of these frames, the ones whose pixels are final (`imageState` is `.ready`): the only screenshots anything
+    /// may look at. The rest are still being encoded, processed or redacted, or will never be readable.
+    static func framesWithFinalImage(db: OpaquePointer, among frameIDs: [Int64]) throws -> Set<Int64> {
+        Set(try finalImageRevisions(db: db, among: frameIDs).keys)
+    }
+
+    /// For each of these frames whose pixels are final, a value that changes whenever the frame is processed
+    /// again or its video is rewritten. A frame read while its value stays the same was read from final pixels.
+    static func finalImageRevisions(db: OpaquePointer, among frameIDs: [Int64]) throws -> [Int64: String] {
+        guard !frameIDs.isEmpty else { return [:] }
+        let placeholders = frameIDs.map { _ in "?" }.joined(separator: ", ")
+        let sql = """
+            SELECT f.id, f.processingStatus, f.rewritePurpose, v.path, v.processingState, \(revisionSQL)
+            FROM frame f
+            LEFT JOIN video v ON v.id = f.videoId
+            WHERE f.id IN (\(placeholders));
+            """
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw DatabaseError.queryFailed(query: sql, underlying: String(cString: sqlite3_errmsg(db)))
+        }
+        for (offset, frameID) in frameIDs.enumerated() {
+            sqlite3_bind_int64(statement, Int32(offset + 1), frameID)
+        }
+        var ready: [Int64: String] = [:]
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let state = imageState(
+                processingStatus: Int(sqlite3_column_int64(statement, 1)),
+                rewritePurpose: sqlite3_column_text(statement, 2).map { String(cString: $0) },
+                hasVideo: sqlite3_column_type(statement, 3) != SQLITE_NULL,
+                videoFinalized: sqlite3_column_type(statement, 4) != SQLITE_NULL
+                    && sqlite3_column_int64(statement, 4) == 0
+            )
+            if state == .ready {
+                ready[sqlite3_column_int64(statement, 0)] = sqlite3_column_text(statement, 5).map { String(cString: $0) } ?? ""
+            }
+        }
+        return ready
+    }
+
     static func latestIndexedDocID(db: OpaquePointer) throws -> Int64? {
         try singleInt64(
             db: db,
@@ -497,6 +538,16 @@ extension DatabaseManager: EmbeddingStoreProtocol {
             throw DatabaseError.connectionFailed(underlying: "Database not initialized")
         }
         return db
+    }
+
+    /// Of these frames, the ones whose screenshot is final: encoded, OCR finished, any redaction burned in.
+    public func framesWithFinalImage(among frameIDs: [Int64]) async throws -> Set<Int64> {
+        try EmbeddingQueries.framesWithFinalImage(db: try embeddingConnection(), among: frameIDs)
+    }
+
+    /// A value that changes whenever this frame's pixels change, or nil while they are not final.
+    public func finalImageRevision(ofFrame frameID: Int64) async throws -> String? {
+        try EmbeddingQueries.finalImageRevisions(db: try embeddingConnection(), among: [frameID])[frameID]
     }
 
     public func embeddingSources(afterDocID docID: Int64, limit: Int) async throws -> [FrameEmbeddingSource] {

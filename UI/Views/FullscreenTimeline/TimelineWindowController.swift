@@ -47,7 +47,19 @@ public class TimelineWindowController: NSObject {
     private var workspaceActivationObserver: Any?
     private let hideCompletionCoordinator = HideCompletionCoordinator()
     private var isHiding = false
-    private var presentationState: PresentationState = .hidden
+    private var presentationState: PresentationState = .hidden {
+        didSet {
+            guard presentationState.isVisibleToClients != oldValue.isVisibleToClients else { return }
+            // The search overlay's result check runs only while the overlay is on screen, and the overlay is
+            // on screen only while the timeline is.
+            guard let viewModel = timelineViewModel else { return }
+            if presentationState.isVisibleToClients {
+                if viewModel.isSearchOverlayVisible { viewModel.searchViewModel.resumeResultCheckIfNeeded() }
+            } else {
+                viewModel.searchViewModel.pauseResultCheck()
+            }
+        }
+    }
     /// Ignore scroll-wheel input for a short grace period after opening in live mode.
     /// This prevents residual trackpad momentum from immediately exiting live mode.
     private var suppressLiveScrollUntil: CFAbsoluteTime = 0

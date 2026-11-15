@@ -55,6 +55,8 @@ public struct SpotlightSearchOverlay: View {
     @State private var isExpanded = false  // Whether to show filters and results (expanded view)
     @State private var refocusSearchField = SearchFieldRefocusRequest.initial
     @State private var keyboardSelectedResultIndex: Int?
+    /// The result the keyboard highlight is on, so that it can follow that result when the list changes.
+    @State private var keyboardSelectedResultKey: String?
     @State private var isResultKeyboardNavigationActive = false
     @State private var shouldFocusFirstResultAfterSubmit = false
     @State private var isRecentEntriesPopoverVisible = false
@@ -446,9 +448,11 @@ public struct SpotlightSearchOverlay: View {
                 requestSearchFieldRefocus()
             }
 
-            // Loading spinner (shown while searching)
-            if viewModel.isSearching {
-                SpinnerView(size: 20, lineWidth: 2, color: .white)
+            // Loading spinner (shown while searching, and dimmer while the result check is still going through
+            // results that are already on screen)
+            if viewModel.isSearching || viewModel.isCheckingResults {
+                SpinnerView(size: 20, lineWidth: 2, color: viewModel.isSearching ? .white : .white.opacity(0.45))
+                    .help(viewModel.isSearching ? "Searching" : "Checking results")
                     // Keep search row height stable while loading so filter bar offset does not shift.
                     .frame(
                         width: SpotlightSearchLayoutMetrics.searchControlButtonSize,
@@ -1227,8 +1231,12 @@ public struct SpotlightSearchOverlay: View {
                 }
             }
             .onChange(of: keyboardSelectedResultIndex) { selectedIndex in
-                guard let selectedIndex else { return }
+                guard let selectedIndex else {
+                    keyboardSelectedResultKey = nil
+                    return
+                }
                 guard visibleResults.indices.contains(selectedIndex) else { return }
+                keyboardSelectedResultKey = SearchViewModel.resultKey(visibleResults[selectedIndex])
                 let selectedResultID = visibleResults[selectedIndex].id
                 withAnimation(.easeOut(duration: 0.15)) {
                     proxy.scrollTo(selectedResultID, anchor: .center)
@@ -1773,6 +1781,7 @@ public struct SpotlightSearchOverlay: View {
         shouldFocusFirstResultAfterSubmit = true
         isResultKeyboardNavigationActive = true
         keyboardSelectedResultIndex = nil
+        keyboardSelectedResultKey = nil
         isRecentEntriesPopoverVisible = false
         resignSearchFieldFocus()
     }
@@ -1788,6 +1797,7 @@ public struct SpotlightSearchOverlay: View {
 
         isResultKeyboardNavigationActive = true
         keyboardSelectedResultIndex = 0
+        keyboardSelectedResultKey = SearchViewModel.resultKey(results[0])
         resignSearchFieldFocus()
     }
 
@@ -1833,17 +1843,22 @@ public struct SpotlightSearchOverlay: View {
             return
         }
 
-        if let index = keyboardSelectedResultIndex {
-            keyboardSelectedResultIndex = min(index, results.count - 1)
-        } else {
-            keyboardSelectedResultIndex = 0
-        }
+        // The highlight follows its result: the result check takes results out while the user may already be
+        // moving through the list, and Enter has to open the result that was highlighted, not its neighbour.
+        let index = SearchViewModel.keyboardSelectionIndex(
+            previousIndex: keyboardSelectedResultIndex,
+            previousKey: keyboardSelectedResultKey,
+            resultKeys: results.map(SearchViewModel.resultKey)
+        )
+        keyboardSelectedResultIndex = index
+        keyboardSelectedResultKey = index.map { SearchViewModel.resultKey(results[$0]) }
     }
 
     private func clearResultKeyboardNavigation() {
         shouldFocusFirstResultAfterSubmit = false
         isResultKeyboardNavigationActive = false
         keyboardSelectedResultIndex = nil
+        keyboardSelectedResultKey = nil
         refreshRecentEntriesPopoverVisibility()
     }
 

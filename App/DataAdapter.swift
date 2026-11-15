@@ -72,6 +72,12 @@ public actor DataAdapter {
 
     /// Finds frames by meaning. Nil until semantic search is wired up (and in tests that don't need it).
     private var semanticSearch: (any SemanticSearchProtocol)?
+    /// The result check (prototype): looks at the best semantic results and says how sure it is of each.
+    private var semanticChecker: (any SemanticResultChecking)?
+    /// Whether the check is switched on right now, and the confidence a result needs to stay.
+    private var semanticCheckIsEnabled: @Sendable () -> Bool = { SemanticCheckSettings.isEnabled }
+    private var semanticCheckCutoff: @Sendable () -> Double = { SemanticCheckSettings.cutoff }
+    private var semanticCheckDeadline: Duration = DataAdapter.semanticCheckDeadline
 
     // MARK: - Initialization
 
@@ -92,6 +98,20 @@ public actor DataAdapter {
     /// Lets search add frames found by meaning to keyword results.
     public func setSemanticSearch(_ semanticSearch: (any SemanticSearchProtocol)?) {
         self.semanticSearch = semanticSearch
+    }
+
+    /// Attaches (or removes) the result check. Without one, or while `SemanticCheckSettings.isEnabled` is
+    /// false, semantic results are shown as the embeddings ranked them.
+    public func setSemanticChecker(
+        _ semanticChecker: (any SemanticResultChecking)?,
+        isEnabled: @escaping @Sendable () -> Bool = { SemanticCheckSettings.isEnabled },
+        cutoff: @escaping @Sendable () -> Double = { SemanticCheckSettings.cutoff },
+        deadline: Duration = DataAdapter.semanticCheckDeadline
+    ) {
+        self.semanticChecker = semanticChecker
+        self.semanticCheckIsEnabled = isEnabled
+        self.semanticCheckCutoff = cutoff
+        self.semanticCheckDeadline = deadline
     }
 
     /// Configure Rewind data source (encrypted SQLCipher database)
@@ -1380,6 +1400,98 @@ public actor DataAdapter {
             searchTimeMs: keywordResults.searchTimeMs + Int(addedMs),
             nextCursor: keywordResults.nextCursor
         )
+    }
+
+    // MARK: - Result check
+
+    /// What the result check should look at on one page of results, or nil when there is nothing for it to do
+    /// (no checker, switched off, nothing found by meaning alone, no screenshot that may be looked at).
+    ///
+    /// Only results found by meaning alone are the model's to judge. A frame that also contains the words (it
+    /// ranked below this page of keyword results) is a keyword match, and stays whatever the model would say.
+    ///
+    /// The model sees a screenshot only when its pixels are final, the rule the image embeddings follow: a frame
+    /// whose redaction has not been burned into the video yet is not looked at, and stays as an unchecked result.
+    private func semanticCheckPlan(for results: SearchResults) async -> SemanticCheckPlan? {
+        let checkable = results.results.filter(\.isSemanticOnly).prefix(SemanticCheckSettings.depth)
+        guard let semanticChecker, semanticCheckIsEnabled(), !checkable.isEmpty else { return nil }
+        let finalImages: Set<Int64>
+        do {
+            finalImages = try await database.framesWithFinalImage(among: checkable.map(\.id.value))
+        } catch {
+            Log.warning("[DataAdapter] Result check skipped, frame states unavailable: \(error)", category: .app)
+            return nil
+        }
+        let candidates = checkable.filter { finalImages.contains($0.id.value) }.map { result in
+            SemanticCheckCandidate(
+                frameID: result.id.value,
+                appName: result.metadata.appBundleID?.split(separator: ".").last.map(String.init),
+                windowName: result.metadata.windowName,
+                videoPath: result.videoPath,
+                frameIndex: result.frameIndex,
+                videoFrameRate: result.videoFrameRate
+            )
+        }
+        guard !candidates.isEmpty else { return nil }
+        return SemanticCheckPlan(
+            checker: semanticChecker,
+            query: results.query.text,
+            candidates: candidates,
+            deadline: semanticCheckDeadline,
+            cutoff: semanticCheckCutoff()
+        )
+    }
+
+    private struct SemanticCheckPlan: Sendable {
+        let checker: any SemanticResultChecking
+        let query: String
+        let candidates: [SemanticCheckCandidate]
+        let deadline: Duration
+        let cutoff: Double
+    }
+
+    /// The result check for a page of results that search has already returned: what it decides about each
+    /// result found by meaning alone, best first, as each answer comes in. Search itself never waits for this.
+    ///
+    /// The stream is empty when there is nothing to check. It ends when every result was looked at or the
+    /// deadline ran out, and a little after the deadline whatever happens, so that a frame that hangs while
+    /// being read cannot leave the caller waiting. Results it says nothing about stay as they are. Ending the
+    /// stream early (a new search) stops the check.
+    public nonisolated func semanticCheckEvents(for results: SearchResults) -> AsyncStream<SemanticCheckEvent> {
+        AsyncStream { continuation in
+            let work = Task {
+                guard let plan = await self.semanticCheckPlan(for: results), !Task.isCancelled else {
+                    continuation.finish()
+                    return
+                }
+                continuation.yield(.started(asked: plan.candidates.count))
+                let started = Date()
+                let backstop = Task {
+                    try? await Task.sleep(for: plan.deadline + Self.semanticCheckGrace)
+                    if !Task.isCancelled { continuation.finish() }
+                }
+                let verdicts = plan.checker.verdicts(for: plan.query, candidates: plan.candidates, deadline: plan.deadline)
+                for await verdict in verdicts {
+                    continuation.yield(
+                        .decided(
+                            frameID: verdict.frameID,
+                            confidence: verdict.confidence,
+                            isKept: verdict.confidence >= plan.cutoff
+                        )
+                    )
+                }
+                backstop.cancel()
+                Log.recordLatency(
+                    "search.semantic.check_ms",
+                    valueMs: Date().timeIntervalSince(started) * 1000,
+                    category: .app,
+                    summaryEvery: 5,
+                    warningThresholdMs: 14000
+                )
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in work.cancel() }
+        }
     }
 
     /// The task's value, or nil if it isn't there within `timeout` (the task is then cancelled and left to
@@ -3821,6 +3933,13 @@ public actor DataAdapter {
     static let semanticDeadline: Duration = .milliseconds(400)
     /// The same, when keyword search found nothing and there is nothing else to show.
     static let semanticDeadlineWhenEmpty: Duration = .seconds(3)
+    /// How long the result check may go on after a search. Thirty checks take about 13 s on an M5 Pro and the
+    /// model 4 s to load when its file is not in memory (measured: 28 of 30 done in 16 s after a cold start), so
+    /// this leaves room for both. Nobody waits for it: the results are on screen, and a new search ends it.
+    /// Results it has not reached by then stay unchecked.
+    public static let semanticCheckDeadline: Duration = .seconds(25)
+    /// How much longer than its deadline the check may take before its stream of answers is ended for it.
+    static let semanticCheckGrace: Duration = .seconds(1)
     /// The constant of reciprocal rank fusion (the usual 60).
     static let semanticFusionConstant = 60.0
 

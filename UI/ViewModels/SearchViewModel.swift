@@ -15,6 +15,8 @@ private struct CachedAppInfo: Codable {
 @MainActor
 public class SearchViewModel: ObservableObject {
     typealias SearchExecutor = @Sendable (SearchQuery) async throws -> SearchResults
+    /// The result check's answers for a page of results (see `AppCoordinator.semanticCheckEvents`).
+    typealias ResultCheckEvents = @Sendable (SearchResults) -> AsyncStream<SemanticCheckEvent>
 
     // MARK: - Recent Search Entry
 
@@ -251,9 +253,19 @@ public class SearchViewModel: ObservableObject {
         didSet {
             resultSetBytes = SearchMemoryEstimator.searchResultsBytes(results?.results ?? [])
             updateVisibleResults()
+            // However the results go away (the search field cleared, the data source changed), their check
+            // goes with them: nothing is asked about a list that is gone, and no spinner is left behind.
+            if results == nil, oldValue != nil {
+                cancelResultCheck()
+                isResultCheckComplete = true
+                resultCheckDecidedFrameIDs = []
+            }
         }
     }
     @Published public var isSearching = false
+    /// True while the result check is still working through the results on screen: results found by meaning
+    /// alone that it turns down are removed as its answers come in.
+    @Published public private(set) var isCheckingResults = false
     @Published public var isLoadingMore = false
     @Published public var error: String?
 
@@ -428,10 +440,21 @@ public class SearchViewModel: ObservableObject {
 
     public let coordinator: AppCoordinator
     private let executeSearch: SearchExecutor
+    private let resultCheckEvents: ResultCheckEvents
     private var cancellables = Set<AnyCancellable>()
 
     // Active search tasks that can be cancelled
     private var currentSearchTask: Task<Void, Never>?
+    private var currentResultCheckTask: Task<Void, Never>?
+    /// False while the results on screen still hold results the check has not got to (it was interrupted, or is
+    /// running). Saved with the cached results, so that a restored list is finished rather than left half checked.
+    private var isResultCheckComplete = true
+    /// Whether the search overlay is on screen. The result check runs only while it is: results that arrive, or
+    /// are restored, while it is not are left for `resumeResultCheckIfNeeded`.
+    private var isResultCheckPresented = false
+    /// Results of the current search the check has already answered for, so that a check picked up again
+    /// after an interruption does not ask about them twice.
+    private var resultCheckDecidedFrameIDs: Set<Int64> = []
     private var currentLoadMoreTask: Task<Void, Never>?
     private var pendingOtherAppsRefreshTask: Task<Void, Never>?
     private var memoryReportTask: Task<Void, Never>?
@@ -501,6 +524,7 @@ public class SearchViewModel: ObservableObject {
     private static let cachedSearchModeKey = "search.cachedSearchMode"
     /// Key for storing the cached sort order
     private static let cachedSearchSortOrderKey = "search.cachedSearchSortOrder"
+    private static let cachedResultCheckCompleteKey = "search.cachedResultCheckComplete"
     /// Cache version - increment when data structure changes to invalidate old caches
     private static let searchCacheVersion = 6  // v6: adds multi-range date filter cache support
     private static let searchCacheVersionKey = "search.cacheVersion"
@@ -540,15 +564,23 @@ public class SearchViewModel: ObservableObject {
         self.executeSearch = { query in
             try await coordinator.search(query: query)
         }
+        self.resultCheckEvents = { results in
+            coordinator.semanticCheckEvents(for: results)
+        }
         loadRecentSearchEntries()
         setupBindings()
         startMemoryReporting()
         prepareThumbnailDiskCache()
     }
 
-    init(coordinator: AppCoordinator, executeSearch: @escaping SearchExecutor) {
+    init(
+        coordinator: AppCoordinator,
+        executeSearch: @escaping SearchExecutor,
+        resultCheckEvents: @escaping ResultCheckEvents = { _ in AsyncStream { $0.finish() } }
+    ) {
         self.coordinator = coordinator
         self.executeSearch = executeSearch
+        self.resultCheckEvents = resultCheckEvents
         loadRecentSearchEntries()
         setupBindings()
         startMemoryReporting()
@@ -1331,6 +1363,9 @@ public class SearchViewModel: ObservableObject {
 
     public func performSearch(query: String, trigger: String = "unknown") async {
         cancelInFlightLoadMore(reason: trigger)
+        cancelResultCheck()
+        isResultCheckComplete = true
+        resultCheckDecidedFrameIDs = []
 
         guard !query.isEmpty else {
             results = nil
@@ -1375,6 +1410,7 @@ public class SearchViewModel: ObservableObject {
                 nextPageCursor = searchResults.nextCursor
                 didReachPaginationEnd = searchResults.nextCursor == nil
                 isSearching = false
+                startResultCheck(for: searchResults)
             }
         } catch is CancellationError {
             await MainActor.run {
@@ -1386,6 +1422,115 @@ public class SearchViewModel: ObservableObject {
                 self.error = "Search failed: \(error.localizedDescription)"
                 isSearching = false
             }
+        }
+    }
+
+    // MARK: - Result check
+
+    /// Starts the result check for results that are now on screen. They stay in the order search gave them;
+    /// a result found by meaning alone that the check turns down is taken out when its answer arrives, so the
+    /// list only ever gets shorter and nothing the user is looking at moves up or down past something else.
+    private func startResultCheck(for searchResults: SearchResults) {
+        cancelResultCheck()
+        let decided = resultCheckDecidedFrameIDs
+        let pending = SearchResults(
+            query: searchResults.query,
+            results: searchResults.results.filter { !($0.isSemanticOnly && decided.contains($0.id.value)) },
+            searchTimeMs: searchResults.searchTimeMs,
+            nextCursor: searchResults.nextCursor
+        )
+        guard pending.results.contains(where: \.isSemanticOnly) else {
+            isResultCheckComplete = true
+            return
+        }
+        // Not complete from this moment, not from the check's first word: the overlay can close while the check
+        // is still working out what to look at, and it has to be picked up again then too.
+        isResultCheckComplete = false
+        // A search that was still running when the overlay was hidden (another dialog took its place) comes back
+        // to a list nobody can see: nothing is checked until the overlay is shown again.
+        guard isResultCheckPresented else { return }
+        let generation = searchGeneration
+        let events = resultCheckEvents(pending)
+        currentResultCheckTask = Task { [weak self] in
+            for await event in events {
+                guard let self, !Task.isCancelled, self.searchGeneration == generation else { return }
+                switch event {
+                case .started:
+                    self.isCheckingResults = true
+                case .decided(let frameID, _, let isKept):
+                    self.resultCheckDecidedFrameIDs.insert(frameID)
+                    if !isKept { self.removeResultTheCheckTurnedDown(frameID: frameID) }
+                }
+            }
+            guard let self, !Task.isCancelled, self.searchGeneration == generation else { return }
+            self.isCheckingResults = false
+            self.isResultCheckComplete = true
+            self.currentResultCheckTask = nil
+        }
+    }
+
+    private func cancelResultCheck() {
+        currentResultCheckTask?.cancel()
+        currentResultCheckTask = nil
+        isCheckingResults = false
+    }
+
+    /// A saved list has replaced what was on screen, so what the check knew about the old list no longer holds:
+    /// the saved list may still contain results the check had since turned down, and they have to be looked at
+    /// again rather than passed over as already answered.
+    ///
+    /// If the saved list's check had been cut short, it is run again from the start. The list is usually restored
+    /// while the timeline is still hidden, and the model is not started for results nobody is looking at: the
+    /// check then waits for the overlay to be shown (`resumeResultCheckIfNeeded`).
+    func resetResultCheck(forRestored restored: SearchResults, checkWasComplete: Bool) {
+        cancelResultCheck()
+        resultCheckDecidedFrameIDs = []
+        isResultCheckComplete = true
+        if !checkWasComplete { startResultCheck(for: restored) }
+    }
+
+    /// Stops the result check without forgetting that it is unfinished: the overlay is being hidden, and nothing
+    /// is checked for a list nobody can see. `resumeResultCheckIfNeeded` picks it up when the overlay is back.
+    public func pauseResultCheck() {
+        isResultCheckPresented = false
+        cancelResultCheck()
+    }
+
+    /// Picks the result check up again for the results on screen if it was stopped before it finished: opening a
+    /// result closes the overlay, which stops the check, and the list is still there when the overlay comes back.
+    public func resumeResultCheckIfNeeded() {
+        isResultCheckPresented = true
+        guard !isResultCheckComplete, currentResultCheckTask == nil, let results else { return }
+        startResultCheck(for: results)
+    }
+
+    /// Identifies a result across changes to the list (the same frame can exist in two sources).
+    static func resultKey(_ result: SearchResult) -> String {
+        "\(result.source)-\(result.id.value)"
+    }
+
+    /// Where the keyboard highlight belongs after the list of results changed. It stays on the result it was on,
+    /// wherever that result now is: when a result above it is taken out, the highlight moves up with its result
+    /// instead of sliding onto the next one. If its own result is gone it stays at the same position (the result
+    /// that took its place), or on the last result if it was at the end.
+    static func keyboardSelectionIndex(previousIndex: Int?, previousKey: String?, resultKeys: [String]) -> Int? {
+        guard !resultKeys.isEmpty else { return nil }
+        if let previousKey, let index = resultKeys.firstIndex(of: previousKey) { return index }
+        guard let previousIndex else { return 0 }
+        return min(max(previousIndex, 0), resultKeys.count - 1)
+    }
+
+    private func removeResultTheCheckTurnedDown(frameID: Int64) {
+        guard var current = results,
+              let index = current.results.firstIndex(where: { $0.id.value == frameID && $0.isSemanticOnly }) else {
+            return
+        }
+        // The result the user has open stays: taking it away under them would be worse than one wrong result.
+        // (The same frame number can exist in another source; that one is a different result.)
+        if let selectedResult, Self.resultKey(selectedResult) == Self.resultKey(current.results[index]) { return }
+        current.results.remove(at: index)
+        withAnimation(.easeOut(duration: 0.2)) {
+            results = current
         }
     }
 
@@ -1666,12 +1811,16 @@ public class SearchViewModel: ObservableObject {
 
             Log.info("[SearchViewModel] Loaded \(moreResults.results.count) more results", category: .ui)
 
+            // The list may have changed while the page was being fetched: the result check takes results out as
+            // its answers arrive. What is on screen now is what the page is added to, not what was there before.
+            let latestResults = results?.results ?? currentResults.results
+
             if moreResults.results.isEmpty {
                 didReachPaginationEnd = true
                 nextPageCursor = nil
                 results = SearchResults(
                     query: currentResults.query,
-                    results: currentResults.results,
+                    results: latestResults,
                     searchTimeMs: moreResults.searchTimeMs,
                     nextCursor: nil
                 )
@@ -1680,8 +1829,9 @@ public class SearchViewModel: ObservableObject {
             }
 
             // Append new results to existing, each frame once (result identity must stay unique).
-            let combinedResults = currentResults.results
-                + moreResults.results.filter { !shownResults.contains("\($0.source)-\($0.id.value)") }
+            let shownNow = Set(latestResults.map { "\($0.source)-\($0.id.value)" })
+            let combinedResults = latestResults
+                + moreResults.results.filter { !shownNow.contains("\($0.source)-\($0.id.value)") }
             results = SearchResults(
                 query: moreResults.query,
                 results: combinedResults,
@@ -2332,6 +2482,7 @@ public class SearchViewModel: ObservableObject {
         UserDefaults.standard.set(contentType.rawValue, forKey: Self.cachedContentTypeKey)
         UserDefaults.standard.set(searchMode.rawValue, forKey: Self.cachedSearchModeKey)
         UserDefaults.standard.set(sortOrder.rawValue, forKey: Self.cachedSearchSortOrderKey)
+        UserDefaults.standard.set(isResultCheckComplete, forKey: Self.cachedResultCheckCompleteKey)
 
         // Force UserDefaults to persist immediately (important for quick close/reopen)
         UserDefaults.standard.synchronize()
@@ -2431,6 +2582,10 @@ public class SearchViewModel: ObservableObject {
             searchGeneration += 1
             nextPageCursor = cachedResults.nextCursor
             didReachPaginationEnd = cachedResults.nextCursor == nil
+            resetResultCheck(
+                forRestored: cachedResults,
+                checkWasComplete: UserDefaults.standard.object(forKey: Self.cachedResultCheckCompleteKey) as? Bool ?? true
+            )
 
             // Restore filters
             selectedAppFilters = cachedAppFilters
@@ -2559,6 +2714,7 @@ public class SearchViewModel: ObservableObject {
         UserDefaults.standard.removeObject(forKey: cachedContentTypeKey)
         UserDefaults.standard.removeObject(forKey: cachedSearchModeKey)
         UserDefaults.standard.removeObject(forKey: cachedSearchSortOrderKey)
+        UserDefaults.standard.removeObject(forKey: cachedResultCheckCompleteKey)
 
         // Remove cached results file
         try? FileManager.default.removeItem(at: cachedSearchResultsPath)
@@ -2596,6 +2752,7 @@ public class SearchViewModel: ObservableObject {
     public func cancelSearch() {
         currentSearchTask?.cancel()
         currentSearchTask = nil
+        cancelResultCheck()
         currentLoadMoreTask?.cancel()
         currentLoadMoreTask = nil
         pendingOtherAppsRefreshTask?.cancel()
@@ -2607,6 +2764,7 @@ public class SearchViewModel: ObservableObject {
     deinit {
         // Cancel tasks directly - deinit is not actor-isolated so we can't call cancelSearch()
         currentSearchTask?.cancel()
+        currentResultCheckTask?.cancel()
         currentLoadMoreTask?.cancel()
         pendingOtherAppsRefreshTask?.cancel()
         memoryReportTask?.cancel()

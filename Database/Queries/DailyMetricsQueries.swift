@@ -48,6 +48,7 @@ public enum DailyMetricsQueries {
         case timelineAutoDismissed = "timeline_auto_dismissed"  // metadata: JSON {trigger: "app_activation", activatedBundleID?}
         case ocrReprocessRequests = "ocr_reprocess_requests"
         case semanticSearchResults = "semantic_search_results"  // metadata: JSON {mode, keywordResults, semanticOnlyResults}
+        case semanticSearchCheck = "semantic_search_check"  // metadata: JSON {asked, answered, rejected, ms}
         case semanticSearchToggled = "semantic_search_toggled"  // metadata: "on", "off", "images_on" or "images_off"
         case semanticIndexRemoved = "semantic_index_removed"  // metadata: "succeeded" or "failed"
         case semanticModelDownload = "semantic_model_download"  // metadata: "<text|imageEncoder>_<succeeded|failed|cancelled>"
