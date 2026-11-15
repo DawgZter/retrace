@@ -6,7 +6,7 @@ Retrace's optional semantic search uses the third-party software listed below. E
 
 - **Project**: llama.cpp, https://github.com/ggml-org/llama.cpp
 - **Licence**: MIT
-- **Where it is used**: `scripts/build_llama_embedding.sh` clones llama.cpp at tag `b11461` (commit `4d756bc72bf00a4aacf410ae15a2d315f3db400d`), applies `scripts/llama-embedding-no-logits.patch`, and builds a static library into `Vendors/llamacpp`. That library is linked into the `RetraceEmbeddingHelper` executable. The llama.cpp source is not in this repository.
+- **Where it is used**: `scripts/build_llama_embedding.sh` clones llama.cpp at tag `v1.0.0` (commit `b1b770d90d94cad9e9ea5b993bdbc383a522fb28`) and builds a static library and `llama-server` into `Vendors/llamacpp`. That library is linked into the `RetraceEmbeddingHelper` executable. The llama.cpp source is not in this repository.
 - llama.cpp's own tree contains further third-party code under its own licences (see its `vendor/` and `licenses/` directories at that tag). Those notices are not reproduced here.
 
 ```
@@ -41,7 +41,6 @@ SOFTWARE.
   - `Sources/RetraceEmbeddingHelper/Embedder.swift` is ported from the text and image paths of DigUp's `LlamaEmbedder`.
   - `Search/Semantic/ImageSizing.swift` ports the image sizing rule from DigUp's `ImageSizing`.
   - `scripts/build_llama_embedding.sh` follows the approach of DigUp's `scripts/build-llama.sh`.
-  - `scripts/llama-embedding-no-logits.patch` is DigUp's `scripts/llama.cpp-no-logits.patch`, unchanged.
 
 ```
 MIT License

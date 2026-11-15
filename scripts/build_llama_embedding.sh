@@ -1,28 +1,29 @@
 #!/bin/bash
-# Builds llama.cpp (MIT) for Retrace's semantic search helper (RetraceEmbeddingHelper).
+# Builds llama.cpp (MIT) for Retrace's semantic search: the library RetraceEmbeddingHelper links, and llama-server,
+# which runs the result check's decision model.
 #
-# Pins one llama.cpp build tag and commit, applies scripts/llama-embedding-no-logits.patch, and leaves a static
-# library and headers in Vendors/llamacpp (not tracked by git):
+# Pins one llama.cpp tag and commit and leaves these in Vendors/llamacpp (not tracked by git):
 #
 #   Vendors/llamacpp/lib/libllamacpp.a
 #   Vendors/llamacpp/include/llama.h, mtmd.h (+ ggml headers)
-#   Vendors/llamacpp/BUILD_STAMP      the tag, patch hash and deployment target this build was made from
+#   Vendors/llamacpp/bin/llama-server
+#   Vendors/llamacpp/BUILD_STAMP      the tag and deployment target this build was made from
 #
 # Package.swift adds the helper target only when that library exists, so `swift build` works without running this:
 # the app then builds without semantic search. This script ends by clearing SwiftPM's manifest cache (see
 # clear_swiftpm_manifest_cache below), so that the next `swift build` sees the library.
 #
-# The approach (pinned tag, the no-logits patch, embedded Metal shaders) follows DigUp's scripts/build-llama.sh
-# (https://github.com/ARahim3/DigUp, MIT).
+# The approach (pinned tag, embedded Metal shaders) follows DigUp's scripts/build-llama.sh
+# (https://github.com/ARahim3/DigUp, MIT). DigUp also patches llama.cpp so that an embedding context does not
+# reserve a vocabulary's worth of logits per token; llama.cpp does that itself from v1.0.0 on, so there is no patch.
 #
 # Usage: scripts/build_llama_embedding.sh        (needs git, cmake and Xcode; takes a few minutes the first time)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-TAG=b11461   # EmbeddingGemma 2 needs b11452 or later
-COMMIT=4d756bc72bf00a4aacf410ae15a2d315f3db400d   # TAG's commit: a tag can be moved, a commit can't
+TAG=v1.0.0   # EmbeddingGemma 2 needs b11452 or later; the vllm-d3 decision models need v1.0.0
+COMMIT=b1b770d90d94cad9e9ea5b993bdbc383a522fb28   # TAG's commit: a tag can be moved, a commit can't
 DEPLOYMENT_TARGET=13.0
-PATCH="$PWD/scripts/llama-embedding-no-logits.patch"
 SOURCE="${LLAMA_SOURCE:-$PWD/Vendors/llamacpp/source}"
 BUILD="${LLAMA_BUILD:-$PWD/Vendors/llamacpp/cmake-build}"
 OUT="$PWD/Vendors/llamacpp"
@@ -40,8 +41,8 @@ clear_swiftpm_manifest_cache() {
   rm -f "$db" "$db-shm" "$db-wal"
 }
 
-STAMP="$TAG $(shasum -a 256 "$PATCH" | cut -c1-12) macos$DEPLOYMENT_TARGET mtmd"
-if [[ -f "$OUT/lib/libllamacpp.a" && "$(cat "$OUT/BUILD_STAMP" 2>/dev/null)" == "$STAMP" ]]; then
+STAMP="$TAG macos$DEPLOYMENT_TARGET mtmd server"
+if [[ -f "$OUT/lib/libllamacpp.a" && -x "$OUT/bin/llama-server" && "$(cat "$OUT/BUILD_STAMP" 2>/dev/null)" == "$STAMP" ]]; then
   echo "llama.cpp $TAG is already built in Vendors/llamacpp"
   clear_swiftpm_manifest_cache
   exit 0
@@ -67,27 +68,20 @@ if [[ "$(git -C "$SOURCE" rev-parse HEAD)" != "$COMMIT" ]]; then
   exit 1
 fi
 
-# Without the patch, an embedding context reserves and clears a vocabulary's worth of logits for every input token
-# (1 MiB per token with Gemma's 262k vocabulary), which an embedding model never produces.
-if git -C "$SOURCE" apply --check "$PATCH" 2>/dev/null; then
-  git -C "$SOURCE" apply "$PATCH"
-elif ! git -C "$SOURCE" apply --reverse --check "$PATCH" 2>/dev/null; then
-  echo "$PATCH doesn't apply to $SOURCE, and isn't applied already: not building it" >&2
-  exit 1
-fi
-
 GENERATOR=$(command -v ninja > /dev/null && echo Ninja || echo "Unix Makefiles")
-# Only the libraries: llama plus mtmd (the image encoder), no tools, server or anything downloaded at build time.
+# The libraries (llama plus mtmd, the image encoder) and llama-server, without its web UI, its other tools or
+# anything downloaded at build time. The server only ever listens on this Mac, so it is built without TLS.
 # No BLAS backend: Accelerate's new cblas entry points need macOS 13.3, and Metal does the work anyway.
 cmake -S "$SOURCE" -B "$BUILD" -G "$GENERATOR" -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" -DCMAKE_OSX_ARCHITECTURES=arm64 \
   -DBUILD_SHARED_LIBS=OFF -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DGGML_NATIVE=OFF -DGGML_BLAS=OFF \
-  -DLLAMA_BUILD_MTMD=ON -DLLAMA_BUILD_COMMON=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_SERVER=OFF \
+  -DLLAMA_BUILD_MTMD=ON -DLLAMA_BUILD_COMMON=ON -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON \
   -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_UI=OFF \
   -DLLAMA_OPENSSL=OFF -DLLAMA_CURL=OFF > /dev/null
-cmake --build "$BUILD" --config Release -j "$(sysctl -n hw.ncpu)" --target llama mtmd > /dev/null
+cmake --build "$BUILD" --config Release -j "$(sysctl -n hw.ncpu)" --target llama mtmd llama-server > /dev/null
 
-mkdir -p "$OUT/lib" "$OUT/include"
+mkdir -p "$OUT/lib" "$OUT/include" "$OUT/bin"
+cp "$BUILD/bin/llama-server" "$OUT/bin/llama-server"
 LIBS=()
 while IFS= read -r lib; do LIBS+=("$lib"); done < <(find "$BUILD" -name '*.a' \
   \( -name libllama.a -o -name libmtmd.a -o -name 'libggml*.a' -o -name 'libvendor-hash.a' \))
@@ -95,4 +89,8 @@ xcrun libtool -static -no_warning_for_no_symbols -o "$OUT/lib/libllamacpp.a" "${
 cp "$SOURCE/include/llama.h" "$SOURCE/tools/mtmd/mtmd.h" "$SOURCE"/ggml/include/*.h "$OUT/include/"
 echo "$STAMP" > "$OUT/BUILD_STAMP"
 clear_swiftpm_manifest_cache
-echo "Built llama.cpp $TAG (patched, Metal, macOS $DEPLOYMENT_TARGET+) into Vendors/llamacpp"
+# SwiftPM does not notice that the headers in Vendors/llamacpp changed, and a helper compiled against the old ones
+# crashes on start when it is linked with the new library (the structs it passes have a different layout). Marking
+# its sources as changed makes the next `swift build` compile them again.
+touch Sources/RetraceEmbeddingHelper/*.swift
+echo "Built llama.cpp $TAG (Metal, macOS $DEPLOYMENT_TARGET+) into Vendors/llamacpp"

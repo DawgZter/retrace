@@ -72,8 +72,7 @@ retrace/
 ├── Package.swift                # Swift Package Manager configuration
 ├── scripts/                     # Build/release/validation scripts
 │   ├── create-release.sh        # Signed Release archive/export helper
-│   ├── build_llama_embedding.sh # Builds pinned llama.cpp into Vendors/llamacpp for RetraceEmbeddingHelper, then clears SwiftPM's manifest cache
-│   ├── llama-embedding-no-logits.patch # One-line llama.cpp patch applied by build_llama_embedding.sh
+│   ├── build_llama_embedding.sh # Builds pinned llama.cpp (library + llama-server) into Vendors/llamacpp, then clears SwiftPM's manifest cache
 │   ├── check_no_nanoseconds_sleep.sh # Guardrail for Task.sleep(nanoseconds:)
 │   ├── validate_sleep_wake_stability.sh # Sleep/wake soak validation workflow
 │   └── validate_darkwake_watchdog.sh # Automated darkwake watchdog regression validation
