@@ -31,10 +31,11 @@ public actor SemanticSearchService: SemanticSearchProtocol {
     /// frames clear it for any query, so callers must also cap how many they take.
     static let defaultGate = 2.0
     /// The share of a frame's standing that comes from its text when it also has a screenshot vector.
-    /// Measured on 66 queries over 26,000 frames: any share from 0.6 to 0.8 put the right frame first more often
-    /// than text alone, than screenshots alone, and than taking the better of the two; none did worse than text
-    /// alone.
-    static let textWeight = 0.7
+    /// Measured over 26,000 frames. On 32 searches for an activity, where many frames are right, an even split
+    /// put more right frames in the first ten than 0.7 did (68% against 64%). On 70 searches with one right
+    /// frame it put that frame first as often (39 times each). Leaning further towards the screenshot added a
+    /// point or two to the first and began to cost the second (34 at 0.2).
+    static let textWeight = 0.5
     /// The text model is kept running this long after a search, for the next one.
     public static let searchWarmInterval: TimeInterval = 2 * 60
     /// The vectors are dropped from memory this long after the last search.
