@@ -12,6 +12,11 @@ import UniformTypeIdentifiers
 /// endpoint (`/v1/systemone`): the screenshot, the app and window title, and one yes/no question. The answer is a
 /// probability; nothing is generated.
 ///
+/// A search that asks for a picture (`SemanticCheckSettings.asksForPicture`) gets two looks per result. Shown the
+/// full screenshot, the model says yes to a page that only has the words on it; shown one too small to read, it
+/// can only go by what is pictured, but mistakes more blurred shapes for the thing. The two are wrong about
+/// different frames, so a result has to pass both, and its confidence is the lower of the two.
+///
 /// Search does not wait for this. Results are shown as the embeddings ranked them, and the answers arrive one
 /// at a time (`verdicts`) while the user is already looking; nothing is asked past the deadline, whether the
 /// model is still loading or an answer is slow.
@@ -129,13 +134,15 @@ public actor SemanticCheckService: SemanticResultChecking {
         // The model is what takes the time, and it does not need the processor that reads frames out of video
         // files. So the next result's frame is read while the model answers for this one: one frame ahead, no
         // more, so that little is read for nothing when the search is abandoned.
-        var ahead: Task<PreparedFrame?, Never>? = Task { [self] in await prepare(candidates[0]) }
+        let twoLooks = SemanticCheckSettings.asksForPicture(text)
+        var ahead: Task<PreparedFrame?, Never>? = Task { [self] in await prepare(candidates[0], small: twoLooks) }
         defer { ahead?.cancel() }
         for (index, candidate) in candidates.enumerated() {
             let remaining = end - ContinuousClock.now
             guard remaining > .zero, !Task.isCancelled else { break }
             let preparing = ahead
-            ahead = index + 1 < candidates.count ? Task { [self] in await prepare(candidates[index + 1]) } : nil
+            ahead = index + 1 < candidates.count
+                ? Task { [self] in await prepare(candidates[index + 1], small: twoLooks) } : nil
             do {
                 guard let prepared = await preparing?.value else { continue }
                 reading += prepared.took
@@ -146,7 +153,22 @@ public actor SemanticCheckService: SemanticResultChecking {
                 guard left > .zero else { break }
                 let askStarted = ContinuousClock.now
                 defer { asking += ContinuousClock.now - askStarted }
-                if let confidence = try await ask(query: text, candidate: candidate, jpeg: prepared.jpeg, timeout: left) {
+                var glance: Double?
+                if let small = prepared.small {
+                    // The small look first: it takes a sixth of the time, and a result it turns down needs no
+                    // second look. It goes without the window title, which is words too.
+                    glance = try await ask(query: text, candidate: candidate, jpeg: small, withWindow: false, timeout: left)
+                    guard let glance else { continue }
+                    if glance < SemanticCheckSettings.cutoff {
+                        result[candidate.frameID] = glance
+                        onAnswer?(SemanticCheckVerdict(frameID: candidate.frameID, confidence: glance))
+                        continue
+                    }
+                }
+                let leftNow = end - ContinuousClock.now
+                guard leftNow > .zero else { break }
+                if let look = try await ask(query: text, candidate: candidate, jpeg: prepared.jpeg, timeout: leftNow) {
+                    let confidence = min(look, glance ?? 1)
                     result[candidate.frameID] = confidence
                     onAnswer?(SemanticCheckVerdict(frameID: candidate.frameID, confidence: confidence))
                 }
@@ -169,6 +191,8 @@ public actor SemanticCheckService: SemanticResultChecking {
     /// A result's screenshot, ready to send, and what its frame was when it was read.
     private struct PreparedFrame: Sendable {
         let jpeg: Data
+        /// The same screenshot too small to read, when the search asks for a picture.
+        let small: Data?
         let revision: String
         let took: Duration
     }
@@ -179,14 +203,19 @@ public actor SemanticCheckService: SemanticResultChecking {
     /// The caller picked frames whose pixels were final, but that was before the model loaded and the results
     /// ahead of this one were checked. So the frame is asked about again here, and counts only if nothing changed
     /// while it was being read.
-    private nonisolated func prepare(_ candidate: SemanticCheckCandidate) async -> PreparedFrame? {
+    private nonisolated func prepare(_ candidate: SemanticCheckCandidate, small: Bool) async -> PreparedFrame? {
         let started = ContinuousClock.now
         guard !Task.isCancelled, let before = await revision(candidate.frameID) else { return nil }
         do {
             let frame = try await image(candidate)
             guard await revision(candidate.frameID) == before,
                   let jpeg = Self.jpeg(from: frame, longestSide: SemanticCheckSettings.imageWidth) else { return nil }
-            return PreparedFrame(jpeg: jpeg, revision: before, took: ContinuousClock.now - started)
+            var smallJPEG: Data?
+            if small {
+                smallJPEG = Self.jpeg(from: frame, longestSide: SemanticCheckSettings.pictureImageWidth)
+                guard smallJPEG != nil else { return nil }
+            }
+            return PreparedFrame(jpeg: jpeg, small: smallJPEG, revision: before, took: ContinuousClock.now - started)
         } catch {
             // A frame that can't be read: that result stays unchecked.
             Log.debug("[SemanticCheck] Frame \(candidate.frameID) not read: \(error)", category: .search)
@@ -208,11 +237,16 @@ public actor SemanticCheckService: SemanticResultChecking {
 
     // MARK: - One request
 
-    static func requestBody(query: String, candidate: SemanticCheckCandidate, jpeg: Data) -> [String: Any] {
+    static func requestBody(
+        query: String,
+        candidate: SemanticCheckCandidate,
+        jpeg: Data,
+        withWindow: Bool = true
+    ) -> [String: Any] {
         let app = candidate.appName.flatMap { $0.isEmpty ? nil : $0 } ?? "unknown"
         let window = candidate.windowName.flatMap { $0.isEmpty ? nil : $0 } ?? "none"
         return [
-            "state": "App: \(app). Window title: \(window).",
+            "state": withWindow ? "App: \(app). Window title: \(window)." : "",
             "images": ["data:image/jpeg;base64," + jpeg.base64EncodedString()],
             "questions": [
                 "match": [
@@ -239,6 +273,7 @@ public actor SemanticCheckService: SemanticResultChecking {
         query: String,
         candidate: SemanticCheckCandidate,
         jpeg: Data,
+        withWindow: Bool = true,
         timeout: Duration
     ) async throws -> Double? {
         var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/systemone")!)
@@ -249,7 +284,7 @@ public actor SemanticCheckService: SemanticResultChecking {
         request.timeoutInterval = min(20, max(0.05, seconds))
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(
-            withJSONObject: Self.requestBody(query: query, candidate: candidate, jpeg: jpeg)
+            withJSONObject: Self.requestBody(query: query, candidate: candidate, jpeg: jpeg, withWindow: withWindow)
         )
         let (data, response) = try await session.data(for: request)
         guard (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }

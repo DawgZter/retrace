@@ -12,7 +12,8 @@ import Shared
 /// The script takes its orders from the text in the model file (`ok`, `never-ready`, `ready-after-2`, `slow`,
 /// `very-slow`, `garbage`, `error`, and `open` for a server that lets any key in)
 /// and answers with the confidence written in the window title ("sure 0.91"), so a test decides what the "model"
-/// says. It appends its process ID to a `pids` file beside the model, its arguments to `args` and every request to
+/// says. A request without a window title (the small look of a search for a picture) gets 0.95, or 0.02 in the
+/// mode `blurry`. It appends its process ID to a `pids` file beside the model, its arguments to `args` and every request to
 /// `requests`, which is how the tests know what was started, what it was asked, and that nothing is left running.
 ///
 /// `testLiveModelSeparatesRightFromWrong` runs the real thing and is skipped unless its environment is set.
@@ -240,6 +241,58 @@ final class SemanticCheckServiceTests: XCTestCase {
         try await Task.sleep(for: .seconds(2))
 
         XCTAssertLessThan(try requests().count, 4, "the check stopped instead of going through all six")
+    }
+
+    // MARK: - A search for a picture
+
+    func testASearchForAPictureLooksTwiceAndBothLooksHaveToSayYes() async throws {
+        let service = try makeService(mode: "ok", image: { _ in Self.image(width: 3024, height: 1964) })
+
+        let answers = await service.confidences(
+            for: "photo of a piano",
+            candidates: [candidate(1, window: "sure 0.91"), candidate(2, window: "sure 0.30")],
+            deadline: .seconds(10)
+        )
+
+        XCTAssertEqual(answers, [1: 0.91, 2: 0.30], "the small look said 0.95 to both: the lower answer counts")
+        let requests = try requests()
+        XCTAssertEqual(requests.map { $0["state"] as? String }, [
+            "", "App: browser. Window title: sure 0.91.",
+            "", "App: browser. Window title: sure 0.30.",
+        ], "the small look comes first and goes without the window title")
+        let sizes = requests.compactMap { $0["bytes"] as? Int }
+        XCTAssertEqual(sizes.count, 4)
+        XCTAssertLessThan(sizes[0] * 2, sizes[1], "the first look is at a much smaller screenshot")
+        let questions = requests.compactMap { ($0["question"] as? [String: Any])?["instructions"] as? String }
+        XCTAssertEqual(Set(questions), ["Does this screenshot show: photo of a piano?"])
+    }
+
+    func testAResultTheSmallLookTurnsDownIsNotLookedAtAgain() async throws {
+        let service = try makeService(mode: "blurry")
+
+        let answers = await service.confidences(
+            for: "piano picture",
+            candidates: [candidate(1, window: "sure 0.91")],
+            deadline: .seconds(10)
+        )
+
+        XCTAssertEqual(answers, [1: 0.02], "the words on the page said yes; the picture did not")
+        XCTAssertEqual(try requests().count, 1)
+    }
+
+    func testOnlySearchesThatAskForAPictureCountAsOne() {
+        for query in [
+            "photo of a leather jacket", "image of a bar chart", "a picture of the whiteboard", "pics of dogs",
+            "leather jacket photo", "whiteboard picture app:Chrome", "photo of a piano -guitar",
+        ] {
+            XCTAssertTrue(SemanticCheckSettings.asksForPicture(query), query)
+        }
+        for query in [
+            "leather jacket", "docker image", "disk image", "leather jacket image", "photo", "picture",
+            "image of", "\"photo of a piano\"", "photoshop tutorial", "the photo booth app", "-photo",
+        ] {
+            XCTAssertFalse(SemanticCheckSettings.asksForPicture(query), query)
+        }
     }
 
     func testFiltersAndExcludedWordsAreNotPartOfTheQuestion() async throws {
@@ -737,11 +790,12 @@ final class SemanticCheckServiceTests: XCTestCase {
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             with open(os.path.join(folder, "requests"), "a") as f:
                 f.write(json.dumps({"path": self.path, "state": body.get("state"), "question": body["questions"]["match"],
-                                    "image": body["images"][0][:23]}) + "\n")
+                                    "image": body["images"][0][:23], "bytes": len(body["images"][0])}) + "\n")
             if mode == "slow": time.sleep(0.6)
             if mode == "very-slow": time.sleep(5)
             if mode == "garbage": return self.reply(200, b"not json")
             if mode == "error": return self.reply(500, {})
+            if not body.get("state"): return self.reply(200, {"answers": {"match": {"noul": 0.02 if mode == "blurry" else 0.95}}})
             sure = re.search(r"sure (\d\.\d+)", body.get("state", ""))
             self.reply(200, {"answers": {"match": {"noul": float(sure.group(1)) if sure else 0.5}}})
 

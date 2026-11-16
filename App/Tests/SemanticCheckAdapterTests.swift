@@ -273,6 +273,20 @@ final class SemanticCheckAdapterTests: XCTestCase {
         XCTAssertEqual(events, [.started(asked: 1), .decided(frameID: byMeaning, confidence: 0.9, isKept: true)])
     }
 
+    func testWhenTheSearchAsksForAPictureAFrameThatContainsTheWordsIsTheModelsToRejectToo() async throws {
+        let withWords = try await insertFrame(text: "Photo of a leather jacket: a buying guide and care tips")
+        let byMeaning = try await insertFrame(text: "Black biker coat hanging on a rail")
+        setMatches([withWords, byMeaning])
+        checker.confidences = [withWords: 0.05, byMeaning: 0.9]
+
+        let (results, events) = try await searchAndCheck("photo of a leather jacket")
+
+        XCTAssertEqual(Set(results), [withWords, byMeaning])
+        XCTAssertEqual(Set(checker.requests.first?.map(\.frameID) ?? []), [withWords, byMeaning])
+        XCTAssertTrue(events.contains(.decided(frameID: withWords, confidence: 0.05, isKept: false)), "\(events)")
+        XCTAssertTrue(events.contains(.decided(frameID: byMeaning, confidence: 0.9, isKept: true)), "\(events)")
+    }
+
     func testAFrameWithTheWordsBelowThePageIsNotTheModelsToReject() async throws {
         let first = try await insertFrame(text: "Refund issued for your laptop order")
         let belowThePage = try await insertFrame(text: "Refund policy link in the page footer")

@@ -1409,11 +1409,15 @@ public actor DataAdapter {
     ///
     /// Only results found by meaning alone are the model's to judge. A frame that also contains the words (it
     /// ranked below this page of keyword results) is a keyword match, and stays whatever the model would say.
+    /// The exception is a search that asks for a picture (`SemanticCheckSettings.asksForPicture`): there the
+    /// words being on screen is not what was asked for, so every result is judged.
     ///
     /// The model sees a screenshot only when its pixels are final, the rule the image embeddings follow: a frame
     /// whose redaction has not been burned into the video yet is not looked at, and stays as an unchecked result.
     private func semanticCheckPlan(for results: SearchResults) async -> SemanticCheckPlan? {
-        let checkable = results.results.filter(\.isSemanticOnly).prefix(SemanticCheckSettings.depth)
+        let query = results.query.text
+        let checkable = results.results.filter { SemanticCheckSettings.judges($0, in: query) }
+            .prefix(SemanticCheckSettings.depth)
         guard let semanticChecker, semanticCheckIsEnabled(), !checkable.isEmpty else { return nil }
         let finalImages: Set<Int64>
         do {

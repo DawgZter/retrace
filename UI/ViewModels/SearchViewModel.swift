@@ -1430,16 +1430,19 @@ public class SearchViewModel: ObservableObject {
     /// Starts the result check for results that are now on screen. They stay in the order search gave them;
     /// a result found by meaning alone that the check turns down is taken out when its answer arrives, so the
     /// list only ever gets shorter and nothing the user is looking at moves up or down past something else.
+    /// When the search asks for a picture, results that contain the words are the check's to take out too.
     private func startResultCheck(for searchResults: SearchResults) {
         cancelResultCheck()
         let decided = resultCheckDecidedFrameIDs
         let pending = SearchResults(
             query: searchResults.query,
-            results: searchResults.results.filter { !($0.isSemanticOnly && decided.contains($0.id.value)) },
+            results: searchResults.results.filter {
+                !(SemanticCheckSettings.judges($0, in: searchResults.query.text) && decided.contains($0.id.value))
+            },
             searchTimeMs: searchResults.searchTimeMs,
             nextCursor: searchResults.nextCursor
         )
-        guard pending.results.contains(where: \.isSemanticOnly) else {
+        guard pending.results.contains(where: { SemanticCheckSettings.judges($0, in: pending.query.text) }) else {
             isResultCheckComplete = true
             return
         }
@@ -1522,7 +1525,9 @@ public class SearchViewModel: ObservableObject {
 
     private func removeResultTheCheckTurnedDown(frameID: Int64) {
         guard var current = results,
-              let index = current.results.firstIndex(where: { $0.id.value == frameID && $0.isSemanticOnly }) else {
+              let index = current.results.firstIndex(where: {
+                  $0.id.value == frameID && SemanticCheckSettings.judges($0, in: current.query.text)
+              }) else {
             return
         }
         // The result the user has open stays: taking it away under them would be worse than one wrong result.

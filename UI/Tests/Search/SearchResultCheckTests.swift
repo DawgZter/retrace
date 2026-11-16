@@ -123,6 +123,23 @@ final class SearchResultCheckTests: XCTestCase {
         try await waitUntil { self.shown(viewModel) == [1, 3, 4] }
     }
 
+    func testWhenTheSearchAsksForAPictureAResultFoundByItsWordsCanBeTakenOut() async throws {
+        let feed = Feed()
+        let results = SearchResults(
+            query: SearchQuery(text: "photo of a refund", limit: 50, mode: .relevant),
+            results: page().results,
+            searchTimeMs: 1
+        )
+        let viewModel = makeViewModel(feed, results: results)
+        viewModel.searchQuery = "photo of a refund"
+        await viewModel.performSearch(query: "photo of a refund", trigger: "test")
+        try await waitUntil { feed.count == 1 }
+
+        feed.send(.started(asked: 4))
+        feed.send(.decided(frameID: 1, confidence: 0.0, isKept: false))
+        try await waitUntil { self.shown(viewModel) == [2, 3, 4] }
+    }
+
     func testTheResultTheUserHasOpenStays() async throws {
         let feed = Feed()
         let results = page()

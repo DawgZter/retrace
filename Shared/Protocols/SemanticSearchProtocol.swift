@@ -343,6 +343,41 @@ public enum SemanticCheckSettings {
         "Does this screenshot show: \(query)?"
     }
 
+    /// Longest side, in pixels, of the second screenshot the model is shown when the search asks for a picture.
+    /// At this size it can still make out a photo and can no longer read the words around it.
+    public static let pictureImageWidth = 512
+
+    private static let pictureWords: Set<String> = [
+        "photo", "photos", "photograph", "photographs", "picture", "pictures", "pic", "pics",
+    ]
+
+    /// Whether `query` asks for a picture of something and not for the words: "photo of a leather jacket",
+    /// "image of a bar chart", "whiteboard picture".
+    ///
+    /// A page that only mentions the thing is then a wrong result, and the model on its own does not see that:
+    /// shown the full screenshot it reads "leather jacket" in a paragraph and says yes. So for these searches it
+    /// looks twice, once at a screenshot too small to read (see `SemanticCheckService`), and it also judges the
+    /// frames keyword search found. Measured with vllm-d3 lite on six such searches (73 right frames, 62 wrong):
+    /// one look kept 70 right and 9 wrong, two looks 68 right and 2 wrong.
+    ///
+    /// Deliberately narrow, because a search this is wrong about loses its keyword results: "image" counts only
+    /// as "image of …" ("docker image" and "disk image" are not pictures), and a quoted phrase never counts.
+    public static func asksForPicture(_ query: String) -> Bool {
+        var words = query.lowercased().split(whereSeparator: \.isWhitespace).map(String.init)
+            .filter { !$0.hasPrefix("-") && !$0.contains(":") }
+        if let last = words.last, pictureWords.contains(last), words.count >= 2 { return true }
+        if let first = words.first, ["a", "an", "the", "some"].contains(first) { words.removeFirst() }
+        guard words.count >= 3, words[1] == "of" else { return false }
+        return pictureWords.contains(words[0]) || words[0] == "image" || words[0] == "images"
+    }
+
+    /// Whether the check may judge this result of a search for `query`, and take it out. Results found by meaning
+    /// alone always; a frame that contains the words only when the search asks for a picture, where the words
+    /// being on screen is not what was asked for.
+    public static func judges(_ result: SearchResult, in query: String) -> Bool {
+        result.isSemanticOnly || asksForPicture(query)
+    }
+
     private static var defaults: UserDefaults {
         UserDefaults(suiteName: "io.retrace.app") ?? .standard
     }
